@@ -6832,6 +6832,57 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
+MCP_HISTORY_NOTICE = {"role": "system", "content":
+                      "Older conversation or tool history was omitted to make room. Continue the current request. "
+                      "Prior tool operations may already have changed files. Check the current files before repeating work."}
+
+
+def compact_mcp_history(svc, hub, messages, tools, kw):
+    """Make room for the next text-only MCP generation without changing the saved chat or splitting tool rounds."""
+    if not hub.settings.get("compact_history") or images_of(messages):
+        return messages
+    ctx = svc.reported_ctx()
+    if not ctx:
+        return messages
+    limit = ctx - CTX_SLACK - min(16384, ctx // 4)
+    original = len(svc.encode_prompt(messages, tools, kw, store=False))
+    if original <= limit:
+        return messages
+
+    users = [i for i, message in enumerate(messages) if message["role"] == "user"]
+    if not users:
+        return messages
+    first, latest = users[0], users[-1]
+    # Each older exchange starts at a user message. Within the current exchange a round starts at an
+    # assistant tool call, and includes all its results up to the next round.
+    rounds = [i for i in range(latest + 1, len(messages)) if messages[i].get("tool_calls")]
+    cuts = users[1:] + rounds[1:]
+    if not cuts:
+        return messages
+    prefix = [m for m in messages[:first] if m["role"] in ("system", "developer") and m != MCP_HISTORY_NOTICE]
+    prefix.append(MCP_HISTORY_NOTICE)
+    # Reclaim extra space on each cut to avoid invalidating the engine's prefix cache every round.
+    target = min(limit, ctx * 3 // 4)
+    low, high = 0, len(cuts) - 1
+    best, best_size = messages, original
+    while low <= high:
+        mid = (low + high) // 2
+        cut = cuts[mid]
+        candidate = prefix + (messages[latest:latest + 1] if cut > latest else []) + messages[cut:]
+        tokens = len(svc.encode_prompt(candidate, tools, kw, store=False))
+        if tokens <= target:
+            best, best_size = candidate, tokens
+            high = mid - 1
+        else:
+            if tokens < best_size:
+                best, best_size = candidate, tokens
+            low = mid + 1
+    if best is not messages:
+        print(f"[strata] MCP context: {original:,} -> {best_size:,} prompt tokens after omitting older history",
+              flush=True)
+    return best
+
+
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
                  mcp_names):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
@@ -6927,6 +6978,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 "Explain any gaps in the available evidence. Do not request or emit further tool calls."})
             yield "mcp", {"event": "limit", "max_rounds": max_rounds}
         try:
+            messages = compact_mcp_history(svc, hub, messages, tools, kw)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
         except ClientGone:                                      # #1999: the client left while a picture was prepared
             done = {**done, "finish": "cancel"}
@@ -8606,9 +8658,10 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            prompt_messages = compact_mcp_history(svc, svc.mcp, messages, tools, kw) if use_mcp else messages
+            ids, thinking, max_new = svc.prepare(prompt_messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+            run = run_with_mcp(svc, svc.mcp, prompt_messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:

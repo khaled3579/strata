@@ -298,6 +298,35 @@ class ToolLoop(unittest.TestCase):
         self.assertIn("<tool_response>\nhello from the tool\n</tool_response>", second)
         self.assertEqual(cs[-1]["usage"]["prompt_tokens"], len(self.engine.prompts[1]))
 
+    def test_compacts_old_turn_before_generation(self):
+        self.start("</think>\n\nContinuing.")
+        self.hub.settings["compact_history"] = True
+        code, text = self.post({"strata_mcp": True, "messages": [
+            {"role": "system", "content": "Project instruction"},
+            {"role": "user", "content": "OLD " * CTX},
+            {"role": "assistant", "content": "Old response"},
+            {"role": "user", "content": "Continue the existing project"},
+        ]})
+        self.assertEqual(code, 200, text)
+        prompt = self.engine.prompt_text(0)
+        self.assertIn("Project instruction", prompt)
+        self.assertIn("Continue the existing project", prompt)
+        self.assertNotIn("Old response", prompt)
+
+    def test_compacts_between_tool_rounds(self):
+        self.start(call_script("fake__echo", text="first-" * 400),
+                   call_script("fake__echo", text="second-" * 400),
+                   "</think>\n\nDone.")
+        self.hub.settings.update(compact_history=True, max_rounds=3)
+        code, text = self.post({"strata_mcp": True}, stream=False)
+        self.assertEqual(code, 200, text)
+        self.assertIn("Done.", text)
+        self.assertIn("first-first-", self.engine.prompt_text(1))
+        prompt = self.engine.prompt_text(2)
+        self.assertIn("check it", prompt)
+        self.assertIn("second-second-", prompt)
+        self.assertNotIn("first-first-", prompt)
+
     def test_a_call_the_output_ends_inside_is_not_run(self):
         """#211: the model's turn ends inside an MCP call: nothing runs (it used to run with no arguments)."""
         script = call_script("fake__echo", text="hello from the tool")
