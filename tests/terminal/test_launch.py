@@ -220,7 +220,8 @@ class PresetStore(unittest.TestCase):
             self.assertEqual(sorted(names), ["Coder 64K", "IQ3_XXS 128K"])
             back = store.load("IQ3_XXS 128K")
             self.assertEqual((back.model, back.context, back.api_key), ("IQ3_XXS", 131072, "sk-secret"))
-            store.touch_used("IQ3_XXS 128K")
+            with mock.patch.object(store, "now_text", return_value="2099-01-01 00:00:00.000000"):
+                store.touch_used("IQ3_XXS 128K")
             self.assertTrue(store.load("IQ3_XXS 128K").last_used)
             self.assertEqual(store.list_presets()[0].name, "IQ3_XXS 128K")          # most recently used first
             store.delete("Coder 64K")

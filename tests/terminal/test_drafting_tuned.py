@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -125,7 +126,10 @@ class MetalPerSet(Base):
         self.put_tuned()
         self.assertTrue(drafting.tuned_ok(self.data))
         self.assertTrue((self.data / "dflash2" / (drafting.TUNED_NAME + ".ok")).is_file())
+        pack = drafting.tuned_path(self.data)
+        modified_at = pack.stat().st_mtime_ns + 2_000_000_000
         self.put_tuned(b"y" * len(TUNED_BYTES))
+        os.utime(pack, ns=(modified_at, modified_at))
         self.assertFalse(drafting.tuned_ok(self.data))
 
     def test_the_users_own_draft_conf_and_spec_are_respected(self):
