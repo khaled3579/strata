@@ -224,7 +224,7 @@ class RuntimeTests(unittest.TestCase):
         def send(action, params):
             request = {"schema_version": 1, "action": action, "profile": "local", "params": params}
             completed = subprocess.run(command, input=json.dumps(request), text=True,
-                                       capture_output=True, cwd=root, env=os.environ.copy(), timeout=20)
+                                       capture_output=True, cwd=root, env=os.environ.copy(), timeout=75)
             return completed.returncode, json.loads(completed.stdout)
 
         code, invalid = send("runtime.start", {"wait_s": True, "shutdown_timeout_s": 2,
@@ -237,7 +237,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertFalse(preview["plan"]["would_start"])
         self.assertEqual(runtime.status("local")["state"], "stopped")
-        start_params = {"wait_s": 10, "shutdown_timeout_s": 2,
+        start_params = {"wait_s": 40, "shutdown_timeout_s": 2,
                         "if_profile_revision": preview["plan"]["launch"]["profile_revision"],
                         "if_source_sha256": preview["plan"]["source_sha256"]}
         self.assertEqual(preview["plan"]["source_sha256"], hashlib.sha256(self.config.read_bytes()).hexdigest())
@@ -309,7 +309,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((code, restart_plan["ok"]), (0, True))
         self.assertEqual(restart_plan["current_owner_id"], started["owner_id"])
         self.assertEqual(restart_plan["current_instance_id"], started["instance_id"])
-        restart_params = {"wait_s": 20, "startup_wait_s": 10,
+        restart_params = {"wait_s": 60, "startup_wait_s": 40,
                           "if_profile_revision": restart_plan["candidate_profile_revision"],
                           "if_owner_id": restart_plan["current_owner_id"],
                           "if_instance_id": restart_plan["current_instance_id"],

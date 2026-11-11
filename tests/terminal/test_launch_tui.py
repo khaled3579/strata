@@ -229,7 +229,7 @@ class ModelStep(Base):
             self.assertIn("84 GB", line)                              # setup.py's download_gb 83.6
             self.assertIn("55 GB", line)                              # the files without the lookup table: 83.6 GB download - 28.8 GB (the owner's rule)
             self.assertIn("(recommended)", line)
-            self.assertIn("› ", line)                                 # the cursor starts on the recommendation
+            self.assertRegex(line, r"^\s*[›>] ")                      # the cursor starts on the recommendation
             big = next(l for l in t.splitlines() if "UD-Q5_K_XL" in l)
             self.assertTrue(big.rstrip().endswith("may run slower"), big)       # 99 GB of weights against 64 GB + 12 GB: a warning, not a block
             self.assertNotIn("SSD ", big)                          # (no "SSD N GB" suffix any more)
@@ -545,7 +545,7 @@ class PicturesParallelTuning(Base):
             self.assertIn("up to 2 hours", t)
             self.assertIn("Skip", t)
             self.assertIn("[ ] Allow settings that change answers very slightly", t)
-            line = next(l for l in t.splitlines() if "›" in l)
+            line = next(l for l in t.splitlines() if l.lstrip().startswith(("› ", "> ")))
             self.assertIn("Quick", line)                              # a first setup recommends tuning
             await press(pilot, "a")
             self.assertIn("[x] Allow settings", text_of(app))
