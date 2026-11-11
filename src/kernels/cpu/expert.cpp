@@ -4,6 +4,7 @@
 // (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
 // include/strata/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <immintrin.h>
 #if defined(_MSC_VER)
@@ -20,8 +21,6 @@
 
 namespace strata::kernels::cpu {
 namespace {
-
-std::atomic<bool> oracle_q8_0{false};
 
 /// fp16 -> fp32, written out rather than using `_cvtsh_ss`, because the F16C intrinsic's behaviour on
 /// subnormals is the one place the two can differ and the scales in this artifact are small.
@@ -152,13 +151,53 @@ inline float hsum_ps(__m256 v) {
 // use this kernel, so speculative decode still reproduces plain decode exactly.
 static const bool kZmm = std::getenv("STRATA_CPU_YMM") == nullptr;
 
-inline __m512i unpack64_q2_0(const uint8_t* codes) {
+inline __m512i unpack64_q2_0_ms(const uint8_t* codes) {
     const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes
     const __m512i lanes = _mm512_cvtepu16_epi64(packed);                    // 8 qwords, 8 codes each
     const __m512i ctrl = _mm512_set1_epi64((long long) 0x0E0C0A0806040200ULL);
     return _mm512_and_si512(_mm512_multishift_epi64_epi8(ctrl, lanes), _mm512_set1_epi8(3));
 }
 
+/// 2-bit unpack WITHOUT VPMULTISHIFTQB (the one VBMI op): byte for byte the multishift's result - output byte j
+/// (code j) is (u16[j/8] >> 2*(j%8)) & 3 - for a CPU with AVX-512 VNNI (dpbusd) but no VBMI (Cascade Lake Xeon;
+/// these used to fall back to the whole AVX-2 kernel).  Four vectors of 16 codes (the u16 pairs 2R and 2R+1), each
+/// a VPERMW source-select + VPSRLVD bit-position shift + mask, truncated to bytes and concatenated in order.  ~8
+/// more instructions per 64 codes: a part of the block's work.
+template <int R>
+inline __m128i unpack_round(const __m512i words, const __m512i shift, const __m512i three) {
+    const __m256i src = _mm256_permutexvar_epi16(                        // code j/8's u16 for j = 16R..16R+15
+        _mm256_setr_epi16((int16_t) (2 * R), (int16_t) (2 * R), (int16_t) (2 * R), (int16_t) (2 * R),
+                          (int16_t) (2 * R), (int16_t) (2 * R), (int16_t) (2 * R), (int16_t) (2 * R),
+                          (int16_t) (2 * R + 1), (int16_t) (2 * R + 1), (int16_t) (2 * R + 1),
+                          (int16_t) (2 * R + 1), (int16_t) (2 * R + 1), (int16_t) (2 * R + 1),
+                          (int16_t) (2 * R + 1), (int16_t) (2 * R + 1)),
+        _mm512_castsi512_si256(words));                                  // the 16 source words
+    const __m512i codes_d = _mm512_and_si512(                            // 16 codes, shifted their bit
+        _mm512_srlv_epi32(_mm512_cvtepu16_epi32(src), shift), _mm512_set1_epi8(3));
+    return _mm512_cvtepi32_epi8(codes_d);                                // 16 dwords -> 16 bytes (VL truncate)
+}
+
+inline __m512i unpack64_q2_0_sw(const uint8_t* codes) {
+    const __m512i words = _mm512_inserti32x4(_mm512_setzero_si512(),      // 8 u16, the rest zero
+                                            _mm_loadu_si128((const __m128i*) codes), 0);
+    const __m512i shift = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 0, 2, 4, 6, 8, 10, 12, 14);
+    const __m512i three = _mm512_set1_epi8(3);
+    return _mm512_inserti32x4(
+        _mm512_inserti32x4(_mm512_inserti32x4(_mm512_inserti32x4(_mm512_setzero_si512(),
+                                                                 unpack_round<0>(words, shift, three), 0),
+                                              unpack_round<1>(words, shift, three), 1),
+                           unpack_round<2>(words, shift, three), 2),
+        unpack_round<3>(words, shift, three), 3);
+}
+
+inline __m512i unpack64_q2_0(const uint8_t* codes) {
+    static const bool vbmi = cpu_vbmi_ok();          // VPMULTISHIFTQB, or the substitute (bit-shifting) one here
+    return vbmi ? unpack64_q2_0_ms(codes) : unpack64_q2_0_sw(codes);
+}
+
+/// STRATA_CPU_YMM=1 keeps the 256-bit rows (whose unpack keeps the multishift): a machine with VNNI but no VBMI
+/// takes the zmm rows (the substitute unpack above), and anything older takes the AVX-2 kernel (expert_layout.cpp's
+/// dispatch).  So one value answers "can this engine's 512-bit q2 path run at all".
 // For blocks [b0, b0+nb) (nb <= 8): p[2i+h] = d_{b0+i} * xscale[2(b0+i)+h], dd[2i+h] = d_{b0+i}.
 inline void scales8(const uint8_t* wscales, const ActQ& a, int b0, int nb, __m512& p, __m512& dd) {
     const __mmask8 m8 = nb >= 8 ? (__mmask8) 0xFF : (__mmask8) ((1u << nb) - 1u);
@@ -336,55 +375,15 @@ void expert_oracle_q8_0(const uint8_t* blob, const ActQ& a1, float* out, ExpertS
                                blob + O_D_SCALES + size_t(r) * SC_D * 2, ws.a2, SC_D);
 }
 
+bool q2_rows_512_ok() {
+    return kZmm && cpu_vnni_ok();
+}
 }  // namespace
 
-const char* CpuFeatures::reason() const {
-    if (usable()) return "ok";
-    // Named individually: "AVX-512 not supported" sends a user looking for a new CPU when the machine may have
-    // AVX-512F and be missing only VNNI, which is a much narrower and more explicable gap.
-    static char buf[160];
-    std::snprintf(buf, sizeof buf, "missing %s%s%s%s%s", avx512f ? "" : "AVX512F ",
-                  avx512bw ? "" : "AVX512BW ", avx512vl ? "" : "AVX512VL ",
-                  avx512_vnni ? "" : "AVX512-VNNI ", avx512_vbmi ? "" : "AVX512-VBMI");
-    return buf;
-}
-
-CpuFeatures cpu_features() {
-    CpuFeatures f;
-    int reg[4] = {0, 0, 0, 0};
-#if defined(_MSC_VER)
-    __cpuid(reg, 0);
-    if (reg[0] < 7) return f;
-    __cpuidex(reg, 7, 0);
-#else
-    unsigned r[4] = {0, 0, 0, 0};
-    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
-    if (r[0] < 7) return f;
-    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
-    for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
-#endif
-    const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
-    f.avx512f = (ebx >> 16) & 1u;
-    f.avx512bw = (ebx >> 30) & 1u;
-    f.avx512vl = (ebx >> 31) & 1u;
-    f.avx512_vnni = (ecx >> 11) & 1u;
-    f.avx512_vbmi = (ecx >> 1) & 1u;
-    return f;
-}
-
-void cpu_require_expert_support() {
-    const CpuFeatures f = cpu_features();
-    if (f.usable()) return;
-    std::fprintf(stderr,
-                 "strata: this CPU cannot run the expert kernel: %s.\n"
-                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
-                 "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
-                 f.reason());
-    std::exit(1);
-}
-
+// CpuFeatures::reason, cpu_features, cpu_require_expert_support and the oracle flag live in expert_layout.cpp: this
+// file is compiled for AVX-512, and the code that finds out whether the CPU has AVX-512 must not be in it (#795).
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
-    if (oracle_q8_0.load(std::memory_order_relaxed)) {
+    if (expert_oracle_q8_0_enabled()) {
         quantize_oracle_q8_0(x, n, a);
         return;
     }
@@ -450,17 +449,13 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
     }
 }
 
-void expert_set_oracle_q8_0(bool enabled) {
-    oracle_q8_0.store(enabled, std::memory_order_relaxed);
-}
-
 void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScratch& ws) {
     act_quant_q8_1(x, H, ws.a1);
     s2_expert_vnni_q(blob, ws.a1, out, ws);
 }
 
 void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws) {
-    if (oracle_q8_0.load(std::memory_order_relaxed)) {
+    if (expert_oracle_q8_0_enabled()) {
         expert_oracle_q8_0(blob, a1, out, ws);
         return;
     }
@@ -479,7 +474,6 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
                          blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, SC_D);
 }
 
-bool expert_oracle_q8_0_enabled() { return oracle_q8_0.load(std::memory_order_relaxed); }
 
 void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
@@ -610,7 +604,7 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
 
 void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
                           ExpertScratchMulti& ws) {
-    if (oracle_q8_0.load(std::memory_order_relaxed) || n_tokens < 1 || n_tokens > MAXT) {
+    if (expert_oracle_q8_0_enabled() || n_tokens < 1 || n_tokens > MAXT) {
         for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
         return;
     }
@@ -678,6 +672,10 @@ void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool q
         }
         out[r] = acc;
     }
+}
+
+bool q2_rows_512_ok() {
+    return kZmm && cpu_vnni_ok();
 }
 
 }  // namespace strata::kernels::cpu

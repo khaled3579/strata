@@ -329,12 +329,20 @@ int main() {
         float* d_at4 = dalloc<float>((size_t) QH * D);
         const bool took = k::qsa_prompt_attn_batch(d_q, pools, d_ids, d_step, cells, s, d_at4, 1, nullptr);
         if (!took) {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
             // AMD: the tensor-core prompt path is CUDA-only, so it refuses every pool and the old kernel runs
             std::printf("[5/5] qsa_prompt_attn mode 3: PASS (refused on HIP - the old kernel runs)\n");
 #else
-            std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
-            g_fail = 1;
+            // a card below compute capability 7.0 (Pascal) never had the tensor-core prompt kernels: the old kernel runs
+            int dev5 = 0, major5 = 0;
+            cudaGetDevice(&dev5);
+            cudaDeviceGetAttribute(&major5, cudaDevAttrComputeCapabilityMajor, dev5);
+            if (major5 > 0 && major5 < 7) {
+                std::printf("[5/5] qsa_prompt_attn mode 3: PASS (refused below sm_70 - the old kernel runs)\n");
+            } else {
+                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
+                g_fail = 1;
+            }
 #endif
         } else {
             k::fwht256_inplace_cuda(d_at4, QH, nullptr);

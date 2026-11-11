@@ -109,7 +109,11 @@ class Monitor(unittest.TestCase):
                         self.assertNotIn("response", record)
 
     def test_error_and_engine_death_are_not_successes(self):
+        # a request the server refuses is an error record: the strict mode (fit_max_tokens off) refuses a max_tokens
+        # that overshoots the context, the default shortens it (serve/test_server.py MaxTokens)
+        self.svc.fit_max_tokens = False
         self.assertEqual(self.chat(max_tokens=20000)[0], 400)
+        self.svc.fit_max_tokens = True
         self.assertEqual(self.latest()["state"], "error")
         for api in ("openai", "anthropic"):
             for stream in (False, True):
@@ -192,6 +196,69 @@ class Monitor(unittest.TestCase):
         self.assertIn("textContent", script)
         self.assertNotIn("innerHTML", script)
         self.assertEqual(self.request("/web/../server.py")[0], 404)
+
+
+class ConversationCacheCard(unittest.TestCase):
+    """#596: /metrics' "conversation_cache": the parked conversations from the engine's log lines, the budget and
+    slots from its INFO line, and how much of the prompts the cache gave back."""
+
+    PARK = ("strata serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=104857600 evictions=0 "
+            "snapshot_bytes=104857600 reused_kv_bytes=0\n")
+    RESTORE = "strata serve: conversation cache: restored 4000 tokens (exact) in 30.0 ms; parked=2 bytes=209715200\n"
+
+    def test_the_log(self):
+        from serve.server import ConvCacheLog
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("an earlier run\n" + self.PARK, encoding="utf-8")
+            start = log.stat().st_size                 # this run starts here: the earlier run's park is not counted
+            c = ConvCacheLog()
+            self.assertEqual(c.poll(str(log), start)["parked"], 0)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("strata serve: something else\n" + self.PARK + self.RESTORE + "strata serve: conversation ca")
+            st = c.poll(str(log), start)
+            self.assertEqual((st["parked"], st["bytes"], st["parks"], st["restores"]), (2, 209715200, 1, 1))
+            self.assertEqual((st["last_event"], st["last_tokens"]), ("restored", 4000))
+            with open(log, "a", encoding="utf-8") as f:   # the cut line is read once it is whole
+                f.write("che: dropped 1 superseded copy of this conversation; parked=1\n")
+            self.assertEqual(c.poll(str(log), start)["parked"], 1)
+            self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
+            self.assertEqual(c.poll(None, None)["parked"], 0)
+
+    def test_metrics(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
+        engine.info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 4}
+        svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                c = json.loads(r.read())["conversation_cache"]
+            self.assertEqual((c["enabled"], c["budget_mib"], c["slots"], c["parked"], c["requests"]),
+                             (True, 8192, 4, 0, 0))
+            req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                                         data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode())
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read()
+            with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                c = json.loads(r.read())["conversation_cache"]
+            self.assertEqual(c["requests"], 1)
+            self.assertGreater(c["last_prompt"], 0)
+            engine.info = {}
+            with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                self.assertFalse(json.loads(r.read())["conversation_cache"]["enabled"])   # off: the reuse lines only
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_the_card_is_on_the_page(self):
+        web = Path(__file__).parent / "web"
+        html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
+        for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note"):
+            self.assertIn(f'id="{el}"', html)
+            self.assertIn(f'"{el}"', js)
 
 
 if __name__ == "__main__":
