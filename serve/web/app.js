@@ -940,7 +940,7 @@ function answerHtml(m) {
     }
     html += toolHtml(t, k) + toolImages(t);
   });
-  return html + answerMarkdown(m.text.slice(pos));
+  return html + answerMarkdown(m.text.slice(pos)) + (m.changeId && busy?.msg !== m ? ProjectChanges.button(m) : "");
 }
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m, x) {
@@ -954,6 +954,7 @@ function onTool(m, x) {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images || [], vision: x.vision === true,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
     if (x.project_changed) ProjectVerification.changed();
+    if (x.change_id) m.changeId = x.change_id;
     if (x.verification) {
       t.verification = x.verification;
       requestAnimationFrame(() => void ProjectVerification.refresh(true));

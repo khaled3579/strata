@@ -84,6 +84,14 @@ main { flex: 1; min-height: 0; display: flex; }
 .verification-error bdi { margin-inline-start: var(--st-s-2); }
 .verification-freshness { color: var(--st-ink-muted); font-size: var(--st-fs-sm); }
 .verification-freshness[data-state="stale"] { color: var(--st-ink); font-weight: 650; }
+.project-changes-button { margin-top: var(--st-s-2); }
+.project-changes-body details { margin-block: var(--st-s-2); }
+.project-changes-body summary { cursor: pointer; overflow-wrap: anywhere; }
+.project-changes-body pre { overflow: auto; white-space: pre; max-height: 45vh; padding: var(--st-s-2); }
+.project-changes-body pre span { display: block; white-space: pre; }
+.project-changes-body .change-add { background: #2b9a4630; }
+.project-changes-body .change-remove { background: #d4455030; }
+.project-changes-footer { display: flex; align-items: center; gap: var(--st-s-2); justify-content: space-between; }
 .tool-call__label { font-size: var(--st-fs-xs); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin: var(--st-s-2) 0 var(--st-s-1); }
 .tool-call__pre { margin: 0; padding: 10px 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
                   font: 400 12.5px/1.5 var(--st-font-mono); color: var(--st-ink-soft); background: var(--st-surface);

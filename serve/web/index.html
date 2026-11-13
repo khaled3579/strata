@@ -361,7 +361,19 @@
 <script src="web/history.js"></script>
 <script src="web/chatstore.js"></script>
 <script src="web/chats-ui.js"></script>
+<dialog class="project-preview" id="project-changes" aria-labelledby="project-changes-title">
+  <div class="project-preview-head">
+    <h2 id="project-changes-title">View changes</h2>
+    <form method="dialog"><button class="st-btn st-btn--secondary" id="project-changes-close">Close</button></form>
+  </div>
+  <div class="project-preview-body project-changes-body" id="project-changes-body"></div>
+  <div class="project-changes-footer">
+    <p id="project-changes-status" role="status"></p>
+    <button type="button" class="st-btn st-btn--secondary" id="project-changes-undo" hidden>Undo changes</button>
+  </div>
+</dialog>
 <script src="web/project-verification.js"></script>
+<script src="web/project-changes.js"></script>
 <script src="web/app.js"></script>
 <script type="module" src="web/project-explorer.js"></script>
 </body>

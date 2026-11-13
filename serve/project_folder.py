@@ -14,6 +14,7 @@ import threading
 
 from serve.mcp import McpHub, McpServer
 from serve.project_checks import ProjectChecks
+from serve.project_changes import ChangeHistory
 
 
 PICK_FOLDER = """
@@ -42,6 +43,7 @@ class ProjectFolders:
         self.files = hub.servers["project_files"]
         self.key = secrets.token_bytes(32)
         self.picker_lock = threading.Lock()
+        self.changes = ChangeHistory()
 
     @classmethod
     def from_hub(cls, hub):
@@ -121,6 +123,8 @@ class ProjectFolders:
         if not files.start():
             raise ValueError(f"Could not start the selected project's file tools: {files.error}")
         hub.servers[files.name] = files
+        hub.project_change_record = self.changes.begin(root)
+        files.project_change_record = hub.project_change_record
         checks = self.files.cfg.get("project_checks")
         if isinstance(checks, dict):
             hub.servers["project_checks"] = ProjectChecks(root, checks)

@@ -6906,6 +6906,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     total, rounds, done = 0, 0, None
     finalizing = False
     needs_project_check = False
+    change_record = getattr(hub, "project_change_record", None)
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
@@ -6956,9 +6957,15 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box = {}
 
-            def work(c=c, box=box):
+            def work(c=c, box=box, s=s, tool=tool):
                 try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel)
+                    def call():
+                        return hub.call(c.name, c.arguments, cancel)
+
+                    if change_record and s and s.name == "project_files":
+                        box["r"], box["change_id"] = change_record.run(tool, c.arguments, call)
+                    else:
+                        box["r"] = call()
                 except McpCancelled:
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
@@ -6974,17 +6981,19 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             if "r" not in box:
                 break
             r = box["r"]
+            change_id = box.get("change_id")
+            project_changed = bool(change_id) or r["ok"] and r["server"] == "project_files" and tool in FILE_CHANGES
             if c.name == PROJECT_CHECK_TOOL:
                 needs_project_check = False
-            elif PROJECT_CHECK_TOOL in mcp_names and r["ok"] and r["server"] == "project_files" and tool in FILE_CHANGES:
+            elif PROJECT_CHECK_TOOL in mcp_names and project_changed:
                 needs_project_check = True
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
             yield "mcp", {"event": "result", "id": c.id,
+                          **({"change_id": change_id} if change_id else {}),
                           **({"verification": r["verification"]} if "verification" in r else {}),
-                          **({"project_changed": True} if r["ok"] and r["server"] == "project_files"
-                             and tool in FILE_CHANGES else {}),
+                          **({"project_changed": True} if project_changed else {}),
                           **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
         if cancel.is_set() or len(results) < len(calls):
@@ -8409,6 +8418,7 @@ def make_handler(svc: Service):
                         svc.active_cancels.discard(self.cancel_event)
                 if getattr(self, "project_files", None) is not None:
                     self.project_files.close()
+                    self.project_files.project_change_record.finished = True
                 record = self.record
                 if record is not None:
                     with svc.status_lock:
@@ -8532,6 +8542,10 @@ def make_handler(svc: Service):
                 if not isinstance(req, dict):
                     raise ValueError("Expected a project request.")
                 root = folders.resolve(req.get("token"))
+                if path in ("/project/changes", "/project/undo"):
+                    report = folders.changes.access(root, req.get("change_id"), undo=path == "/project/undo")
+                    self._json(200, report, headers={"Cache-Control": "no-store"})
+                    return
                 if path == "/project/revision":
                     revision, _ = project_snapshot(root)
                     self._json(200, {"revision": revision}, headers={"Cache-Control": "no-store"})

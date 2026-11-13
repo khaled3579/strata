@@ -31,6 +31,8 @@ This fork builds on Strata 0.2.13, a local inference engine with browser chat, a
 
 The verification report appears before the final reply. It shows build and test status, reported test counts, the first error with its source location when available, and checks that did not run. It flags results when project files change.
 
+After Strata edits a project, **View changes** shows the files and their text diffs. You can undo the latest recorded reply in the current server session. Strata checks the affected files for later edits before restoring their earlier contents.
+
 [وصف النسخة وسجل التعديلات ودليل الإعداد](docs/PROJECT_WEB.md)
 
 ## Models

@@ -44,6 +44,7 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
   }
 
   window.projectFolderForChat = () => nativeMode ? chatFolder() : null;
+  window.refreshProjectTree = refreshTree;
   window.syncProjectFolder = () => {
     if (!mcpInfo.project_picker) return;
     nativeMode = true;
