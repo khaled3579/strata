@@ -601,6 +601,8 @@ class McpHub:
                 res = server.call(tool, arguments if isinstance(arguments, dict) else {},
                                   float(server.cfg.get("timeout_s", self.settings["timeout_s"])), cancel)
                 text, ok = result_text(res), not res.get("isError")
+                if getattr(server, "verification_report", False) and isinstance(res.get("verification"), dict):
+                    out["verification"] = res["verification"]
                 if ok and self.settings["image_results"] and self.media_dir is not None:
                     try:
                         images = cache_images(res, self.media_dir)

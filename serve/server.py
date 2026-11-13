@@ -63,7 +63,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, ToolCa
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
-from serve.project_checks import FILE_CHANGES, TOOL as PROJECT_CHECK_TOOL  # noqa: E402
+from serve.project_checks import FILE_CHANGES, TOOL as PROJECT_CHECK_TOOL, snapshot as project_snapshot  # noqa: E402
 from serve.project_folder import ProjectFolders, is_link, open_file as open_project_file  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
@@ -6982,6 +6982,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
             yield "mcp", {"event": "result", "id": c.id,
+                          **({"verification": r["verification"]} if "verification" in r else {}),
+                          **({"project_changed": True} if r["ok"] and r["server"] == "project_files"
+                             and tool in FILE_CHANGES else {}),
                           **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
         if cancel.is_set() or len(results) < len(calls):
@@ -8529,6 +8532,10 @@ def make_handler(svc: Service):
                 if not isinstance(req, dict):
                     raise ValueError("Expected a project request.")
                 root = folders.resolve(req.get("token"))
+                if path == "/project/revision":
+                    revision, _ = project_snapshot(root)
+                    self._json(200, {"revision": revision}, headers={"Cache-Control": "no-store"})
+                    return
                 target = folders.entry(root, req.get("parts"))
                 if path == "/project/entries":
                     with os.scandir(target) as items:

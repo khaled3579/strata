@@ -934,6 +934,10 @@ function answerHtml(m) {
     const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
     if (at > pos) html += answerMarkdown(m.text.slice(pos, at));
     pos = at;
+    if (t.verification || t.name === "project_checks__run" && t.state === "running") {
+      const arabic = /[\u0600-\u06ff]/.test(m.verificationLanguage || "");
+      html += ProjectVerification.card(t.verification || {status: "running"}, m.verificationProject, arabic);
+    }
     html += toolHtml(t, k) + toolImages(t);
   });
   return html + answerMarkdown(m.text.slice(pos));
@@ -949,6 +953,13 @@ function onTool(m, x) {
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images || [], vision: x.vision === true,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
+    if (x.project_changed) ProjectVerification.changed();
+    if (x.verification) {
+      t.verification = x.verification;
+      requestAnimationFrame(() => void ProjectVerification.refresh(true));
+    } else if (t.name === "project_checks__run" && x.skipped) {
+      t.verification = {status: "skipped"};
+    }
   }
 }
 function updateAssistant(el, m, streaming) {
@@ -967,8 +978,7 @@ function updateAssistant(el, m, streaming) {
   }
   const bubble = el.querySelector(".st-bubble");
   if (m.error) {
-    bubble.innerHTML = `<div class="msg-error"></div>`;
-    bubble.firstChild.textContent = m.error;
+    bubble.innerHTML = answerHtml(m) + `<div class="msg-error">${esc(m.error)}</div>`;
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
@@ -990,6 +1000,7 @@ function renderChat() {
   renderParent();
   renderUndoBar();
   scrollDown(true);
+  void ProjectVerification.refresh();
 }
 // Follow the answer while the reader has not left (#4014). Asking "am I within 120 px of the bottom?" on every frame pulled
 // the view back after every wheel notch (a notch is about 100 px), so scrolling up during a long answer only worked by
@@ -1244,6 +1255,10 @@ async function generateReply() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   const projectFolder = window.projectFolderForChat?.();
+  if (projectFolder) {
+    m.verificationProject = projectFolder.path;
+    m.verificationLanguage = messages.at(-2)?.text?.slice(0, 500);
+  }
   if (settings.mcp !== false && (mcpInfo.tools > 0 || projectFolder)) {
     body.strata_mcp = true;
     if (projectFolder) body.strata_project = projectFolder.token;
@@ -1322,7 +1337,11 @@ async function generateReply() {
   } else if (m.stopped) {
     m.meta = cut ? tr("chat.interrupted", "Interrupted") : tr("chat.stopped", "Stopped");
   }
-  for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
+  for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") {
+    t.state = "skipped";
+    t.ms = null;
+    if (t.name === "project_checks__run") t.verification = {status: "skipped"};
+  }
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.toolCalls", {one: "{n} tool call", other: "{n} tool calls"}, {n: ran})}`;
   if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "stopped at the limit of {n} tool rounds (mcp.max_rounds)", {n: m.limit})}`;

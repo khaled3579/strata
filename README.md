@@ -29,6 +29,8 @@
 
 This fork builds on Strata 0.2.13, a local inference engine with browser chat, a desktop app, terminal tools, and OpenAI- and Anthropic-compatible APIs. On Windows, the Project sidebar connects each chat to the folder you choose. Strata can edit project files and run offline builds and tests in a Windows AppContainer before delivering changes. The web interface includes file previews, Explorer and VS Code actions, code saving, and Arabic/English chat rendering.
 
+The verification report appears before the final reply. It shows build and test status, reported test counts, the first error with its source location when available, and checks that did not run. It flags results when project files change.
+
 [وصف النسخة وسجل التعديلات ودليل الإعداد](docs/PROJECT_WEB.md)
 
 ## Models

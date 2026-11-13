@@ -1,5 +1,6 @@
 """Discover and run project build/test commands in an offline Windows AppContainer."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import threading
 import time
 
 from serve.mcp import McpCancelled
+from serve.project_verification import check_kind, first_error, test_count
 
 
 TOOL = "project_checks__run"
@@ -90,23 +92,25 @@ def discover(root):
     return result
 
 
-def snapshot(source, destination, cancel):
-    """Copy regular files only. Junctions/symlinks are never traversed."""
-    if destination.is_relative_to(source):
+def snapshot(source, destination=None, cancel=None):
+    """Fingerprint the source entries and optionally copy regular files."""
+    if destination is not None and destination.is_relative_to(source):
         raise ValueError("Select the project directory inside this drive. The selected root includes Strata's temporary workspace.")
     pending = [(source, destination)]
     count = total = skipped = 0
+    entries_seen = []
     reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     while pending:
-        if cancel.is_set():
+        if cancel is not None and cancel.is_set():
             raise McpCancelled("Project checks stopped.")
         folder, target = pending.pop()
         if folder.resolve(strict=True) != folder or getattr(folder.lstat(), "st_file_attributes", 0) & reparse:
             raise ValueError("A project directory changed while preparing the snapshot. Run the check again.")
-        target.mkdir()
+        if target is not None:
+            target.mkdir()
         with os.scandir(folder) as entries:
             for entry in entries:
-                if cancel.is_set():
+                if cancel is not None and cancel.is_set():
                     raise McpCancelled("Project checks stopped.")
                 if entry.name.lower() in SKIP:
                     continue
@@ -114,20 +118,23 @@ def snapshot(source, destination, cancel):
                 if getattr(info, "st_file_attributes", 0) & reparse or stat.S_ISLNK(info.st_mode):
                     skipped += 1
                     continue
-                output = target / entry.name
+                path = Path(entry.path)
+                output = target / entry.name if target is not None else None
+                identity = str(path.relative_to(source))
                 if stat.S_ISDIR(info.st_mode):
-                    pending.append((Path(entry.path), output))
+                    entries_seen.append((identity, "directory"))
+                    pending.append((path, output))
                 elif stat.S_ISREG(info.st_mode):
                     count += 1
                     total += info.st_size
                     if count > MAX_FILES or total > MAX_BYTES:
                         raise ValueError("The project exceeds the snapshot limit (100,000 files or 2 GiB). Choose its project folder.")
-                    path = Path(entry.path)
-                    if path.resolve(strict=True) != path:
-                        skipped += 1
-                        continue
-                    shutil.copyfile(path, output)
-    return skipped
+                    entries_seen.append((identity, info.st_size, info.st_mtime_ns, info.st_ino, info.st_ctime_ns))
+                    if output is not None:
+                        if path.resolve(strict=True) != path:
+                            raise ValueError("A project file changed while preparing the snapshot. Run the check again.")
+                        shutil.copyfile(path, output)
+    return hashlib.sha256(repr(sorted(entries_seen)).encode("utf-8", "surrogatepass")).hexdigest(), skipped
 
 
 def toolchain(commands, configured, scratch, container, env):
@@ -206,10 +213,16 @@ def toolchain(commands, configured, scratch, container, env):
     return tools
 
 
-def output_tail(stream):
+def check_output(stream):
     size = stream.seek(0, os.SEEK_END)
+    stream.seek(0)
+    start = stream.read(128 * 1024)
+    if size > len(start):
+        stream.seek(max(len(start), size - 128 * 1024))
+        start += b"\n" + stream.read(128 * 1024)
     stream.seek(max(0, size - 2500))
-    return ("[Earlier output omitted]\n" if size > 2500 else "") + stream.read(2500).decode("utf-8", "replace").strip()
+    tail = ("[Earlier output omitted]\n" if size > 2500 else "") + stream.read(2500).decode("utf-8", "replace").strip()
+    return start.decode("utf-8", "replace"), tail
 
 
 def run_checks(root, config, cancel, timeout):
@@ -226,10 +239,11 @@ def run_checks(root, config, cancel, timeout):
                                          ignore_cleanup_errors=True) as tmp:
             scratch = Path(tmp)
             work = scratch / "Project"
-            skipped = snapshot(root, work, cancel)
+            revision, skipped = snapshot(root, work, cancel)
             commands = discover(work)
             if not commands:
-                return {"status": "unsupported", "message": "No build or tests detected. Set commands in .strata-checks.json."}
+                return {"status": "unsupported", "revision": revision,
+                        "message": "No build or tests detected. Set commands in .strata-checks.json."}
             env = {key: os.environ[key] for key in ("SystemRoot", "SystemDrive", "WINDIR", "LOCALAPPDATA")}
             env.update(TEMP=tmp, TMP=tmp, USERPROFILE=tmp, HOME=tmp, APPDATA=tmp, CI="true", NO_COLOR="1")
             results = []
@@ -238,7 +252,7 @@ def run_checks(root, config, cancel, timeout):
                 tools = toolchain(commands, config, scratch, container, env)
                 container.allow(scratch, "M", temporary=True)
                 for name, directory, argv in commands:
-                    result = {"check": name, "status": "unavailable"}
+                    result = {"check": name[:350], "kind": check_kind(argv), "status": "unavailable"}
                     results.append(result)
                     if cancel.is_set():
                         raise McpCancelled("Project checks stopped.")
@@ -261,17 +275,27 @@ def run_checks(root, config, cancel, timeout):
                             result.update(status="timed_out", output="The command exceeded its time limit.")
                         except OSError as error:
                             result.update(status="setup_failed", output=str(error))
-                        output = (output_tail(log).replace(str(work) + "\\", "")
-                                  .replace(tmp, "<check>").replace(scratch.as_posix(), "<check>"))
-                        if (argv[0] == "python" and argv[1:4] == ["-m", "unittest", "discover"]
-                                and result["status"] == "passed" and "Ran 0 tests" in output):
-                            result["status"] = "no_tests"
+                        evidence, output = check_output(log)
+                        for prefix, replacement in ((str(work) + "\\", ""), (work.as_posix() + "/", ""),
+                                                    (tmp, "<check>"), (scratch.as_posix(), "<check>")):
+                            evidence = evidence.replace(prefix, replacement)
+                            output = output.replace(prefix, replacement)
+                        if result["kind"] == "test" and result["status"] in ("passed", "failed"):
+                            result["test_count"] = test_count(evidence)
+                            if result["test_count"] == 0 and (result["status"] == "passed" or
+                                    "no tests ran" in evidence or "No tests were found" in evidence):
+                                result["status"] = "no_tests"
+                        if result["status"] in ("failed", "setup_failed", "timed_out"):
+                            result["first_error"] = first_error(evidence) or {
+                                "message": result.get("output") or f"Command exited with code {result.get('exit_code')}."
+                            }
                         if output:
                             result["output"] = "\n".join(filter(None, (result.get("output"), output)))
                     if name == "CMake configure":
                         cmake_ready = result["status"] == "passed"
                     result["seconds"] = round(time.monotonic() - started, 1)
             return {"status": "passed" if all(r["status"] == "passed" for r in results) else "incomplete",
+                    "revision": revision,
                     "isolation": "Windows AppContainer (offline)", "skipped_links": skipped, "checks": results}
     finally:
         _run_lock.release()
@@ -280,6 +304,7 @@ def run_checks(root, config, cancel, timeout):
 class ProjectChecks:
     name = "project_checks"
     status = "ready"
+    verification_report = True
     tools = [{"name": "run", "description": "Detect and run this project's build and tests on a fresh offline Windows snapshot. Returns actual exit codes and diagnostic output.",
               "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}}]
 
@@ -295,4 +320,6 @@ class ProjectChecks:
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             report = {"status": "setup_failed", "message": str(error)}
         return {"content": [{"type": "text", "text": json.dumps(report, ensure_ascii=False, indent=2)}],
+                "verification": {**report, "checks": [{k: v for k, v in row.items() if k != "output"}
+                                                     for row in report.get("checks", [])]},
                 "isError": report["status"] != "passed"}

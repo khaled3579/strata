@@ -54,6 +54,7 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
     storageStatus.textContent = "";
     if (folder) {
       selectFolder({ ...folder, kind: "directory" }, true);
+      queueMicrotask(() => void ProjectVerification.refresh(true));
       return;
     }
     root = null;

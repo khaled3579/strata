@@ -72,6 +72,18 @@ main { flex: 1; min-height: 0; display: flex; }
 .tool-call .st-badge, .tool-call summary .small { flex: none; }
 .tool-call[data-state="error"] { border-color: color-mix(in srgb, var(--st-danger) 35%, var(--st-line)); }
 .tool-call[data-state="running"] .st-badge::before, .tool-call[data-state="writing"] .st-badge::before { animation: blink 1s steps(2) infinite; }
+.verification-card { margin: var(--st-s-3) 0; padding: var(--st-s-3); border: 1px solid var(--st-line, #68738680);
+  border-radius: 10px; background: var(--st-surface, transparent); text-align: start; overflow-wrap: anywhere; }
+.verification-card header { display: flex; align-items: center; gap: var(--st-s-2); flex-wrap: wrap; }
+.verification-card header > span { margin-inline-start: auto; color: var(--st-ink-muted); }
+.verification-card dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); gap: var(--st-s-2); margin: var(--st-s-3) 0; }
+.verification-card dt { font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.verification-card dd { margin: 0; font-weight: var(--st-fw-medium); }
+.verification-card p, .verification-card ul { margin-block: var(--st-s-1); }
+.verification-error { border-inline-start: 3px solid currentColor; padding-inline-start: var(--st-s-2); margin-block: var(--st-s-2); }
+.verification-error bdi { margin-inline-start: var(--st-s-2); }
+.verification-freshness { color: var(--st-ink-muted); font-size: var(--st-fs-sm); }
+.verification-freshness[data-state="stale"] { color: var(--st-ink); font-weight: 650; }
 .tool-call__label { font-size: var(--st-fs-xs); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin: var(--st-s-2) 0 var(--st-s-1); }
 .tool-call__pre { margin: 0; padding: 10px 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
                   font: 400 12.5px/1.5 var(--st-font-mono); color: var(--st-ink-soft); background: var(--st-surface);
