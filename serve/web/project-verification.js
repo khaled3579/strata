@@ -20,6 +20,8 @@ const ProjectVerification = (() => {
     links: ["Linked files and folders were excluded.", "استُبعدت الملفات والمجلدات المرتبطة."],
     dependency: ["Missing dependency", "تبعية مفقودة"],
     command: ["Command", "الأمر"],
+    smoke: ["Browser smoke test", "اختبار التشغيل في المتصفح"],
+    browser_errors: ["Browser errors", "أخطاء المتصفح"],
   };
   const words = (key, ar) => (labels[key] || labels.incomplete)[ar ? 1 : 0];
   let current = null, inFlight = false, generation = 0;
@@ -88,6 +90,7 @@ const ProjectVerification = (() => {
     const rows = report.checks || [];
     const build = rows.filter(row => row.kind === "build");
     const tests = rows.filter(row => row.kind === "test");
+    const smoke = rows.find(row => row.kind === "smoke");
     const counted = tests.filter(row => Number.isInteger(row.test_count));
     const sum = counted.reduce((n, row) => n + row.test_count, 0);
     const missing = rows.filter(row => !["passed", "failed"].includes(row.status));
@@ -101,8 +104,16 @@ const ProjectVerification = (() => {
     return `<section class="verification-card" aria-label="${label("title")}" lang="${ar ? "ar" : "en"}" dir="${ar ? "rtl" : "ltr"}"
       ${revision ? `data-verification-revision="${esc(revision)}" data-verification-project="${esc(project)}"` : ""}>
       <header>${icon("check", "st-icon st-icon--sm")} <strong>${label("title")}</strong><span>${label(report.status)}</span></header>
-      ${report.status === "running" ? "" : `<dl>${metric("build", label(status(build)))}${metric("test", label(status(tests)))}${metric("count", count)}</dl>`}
+      ${report.status === "running" ? "" : `<dl>${metric("build", label(status(build)))}${metric("test", label(status(tests)))}${metric("count", count)}
+        ${smoke ? metric("smoke", label(smoke.status)) : ""}</dl>`}
       ${report.message ? `<p dir="auto">${esc(report.message)}</p>` : ""}
+      ${smoke ? `<div class="verification-smoke">
+        ${smoke.page ? `<p dir="auto"><bdi><code>${esc(smoke.page)}</code></bdi>${smoke.http ? ` · HTTP ${esc(smoke.http)}` : ""}
+          ${smoke.title ? ` · <bdi>${esc(smoke.title)}</bdi>` : ""}</p>` : ""}
+        ${smoke.detail ? `<p dir="auto">${esc(smoke.detail)}</p>` : ""}
+        ${smoke.browser_errors?.length ? `<details><summary>${label("browser_errors")} (${fmt(smoke.browser_errors.length)})</summary>
+          <ul>${smoke.browser_errors.map(error => `<li dir="auto">${esc(error)}</li>`).join("")}</ul></details>` : ""}
+        </div>` : ""}
       ${error ? `<div class="verification-error"><strong>${label("first")}</strong>
         ${error.file ? `<bdi><code dir="ltr">${esc(error.file)}:${esc(error.line)}</code></bdi>` : ""}
         <p dir="auto">${esc(error.message)}</p></div>` : ""}

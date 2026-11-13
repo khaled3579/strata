@@ -35,6 +35,8 @@ After Strata edits a project, **View changes** shows the files and their text di
 
 **Check settings** lists the detected build and test commands for the selected project. Edit the commands and their working folders, save them with the project, or return to automatic detection. The verification report pairs identified missing dependencies with the affected commands.
 
+The optional browser smoke test opens the home page of a built web project inside an offline Windows Sandbox. The verification card reports the HTTP status, page title, browser errors, or the reason the check could not run.
+
 [وصف النسخة وسجل التعديلات ودليل الإعداد](docs/PROJECT_WEB.md)
 
 ## Models

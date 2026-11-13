@@ -14,6 +14,7 @@ import time
 
 from serve.mcp import McpCancelled
 from serve.project_verification import check_kind, first_error, missing_dependency, test_count
+from serve.project_smoke import plan as smoke_plan, run_smoke
 
 
 TOOL = "project_checks__run"
@@ -81,6 +82,8 @@ def settings_bytes(root):
 
 def configured_commands(root, data):
     config = json.loads(data.decode("utf-8-sig"))
+    if isinstance(config, dict) and "commands" not in config and "smoke" in config:
+        return discover(root, automatic=True)
     return command_rows(root, config.get("commands") if isinstance(config, dict) else None)
 
 
@@ -96,13 +99,21 @@ def check_settings(root, update=None):
         if update is not None:
             if update.get("version") != version:
                 raise ValueError("Check settings changed since they were opened. Reopen the settings and try again.")
+            try:
+                previous = json.loads(data.decode("utf-8-sig")) if data is not None else {}
+            except ValueError:
+                previous = {}
+            saved = {**previous} if isinstance(previous, dict) else {}
             if update.get("automatic") is True:
+                saved.pop("commands", None)
+            else:
+                rows = command_rows(root, update.get("commands"))
+                saved["commands"] = [{"argv": argv, "cwd": cwd} for _, cwd, argv in rows]
+            if not saved:
                 (root / SETTINGS_FILE).unlink(missing_ok=True)
                 data = None
             else:
-                rows = command_rows(root, update.get("commands"))
-                data = json.dumps({"commands": [{"argv": argv, "cwd": cwd} for _, cwd, argv in rows]},
-                                  ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+                data = json.dumps(saved, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
                 if len(data) > 256 * 1024:
                     raise ValueError("Check settings are limited to 256 KiB.")
                 fd, name = tempfile.mkstemp(prefix=".strata-checks-", suffix=".tmp", dir=root)
@@ -113,15 +124,18 @@ def check_settings(root, update=None):
                 finally:
                     Path(name).unlink(missing_ok=True)
         error = ""
+        automatic = data is None
         try:
-            effective = configured_commands(root, data) if data is not None else detected
+            config = json.loads(data.decode("utf-8-sig")) if data is not None else {}
+            automatic = automatic or isinstance(config, dict) and "commands" not in config and "smoke" in config
+            effective = detected if automatic else configured_commands(root, data)
         except ValueError as exc:
             effective, error = detected, str(exc)
 
         def describe(rows):
             return [{"argv": argv, "cwd": cwd, "kind": check_kind(argv)} for _, cwd, argv in rows]
 
-        return {"version": hashlib.sha256(data).hexdigest() if data is not None else "automatic", "automatic": data is None,
+        return {"version": hashlib.sha256(data).hexdigest() if data is not None else "automatic", "automatic": automatic,
                 "detected": describe(detected), "commands": describe(effective),
                 "error": error or detection_error}
 
@@ -211,6 +225,17 @@ def snapshot(source, destination=None, cancel=None):
     return hashlib.sha256(repr(sorted(entries_seen)).encode("utf-8", "surrogatepass")).hexdigest(), skipped
 
 
+def stage_python(python):
+    source = Path(sys.base_prefix)
+    python.mkdir()
+    for item in [source / "python.exe", *source.glob("*.dll")]:
+        if item.is_file():
+            shutil.copyfile(item, python / item.name)
+    for name in ("DLLs", "Lib"):
+        if (source / name).is_dir():
+            shutil.copytree(source / name, python / name, ignore=shutil.ignore_patterns("site-packages", "__pycache__"))
+
+
 def toolchain(commands, configured, scratch, container, env):
     requested = {argv[0] for _, _, argv in commands}
     windows = Path(env["SystemRoot"])
@@ -234,15 +259,8 @@ def toolchain(commands, configured, scratch, container, env):
                 env.update(npm_config_offline="true", npm_config_audit="false", npm_config_fund="false",
                            npm_config_cache=str(scratch / "npm-cache"), npm_config_script_shell=str(windows / "System32/cmd.exe"))
     if "python" in requested:
-        source = Path(sys.base_prefix)
         python = scratch / "Python"
-        python.mkdir()
-        for item in [source / "python.exe", *source.glob("*.dll")]:
-            if item.is_file():
-                shutil.copyfile(item, python / item.name)
-        for name in ("DLLs", "Lib"):
-            if (source / name).is_dir():
-                shutil.copytree(source / name, python / name, ignore=shutil.ignore_patterns("site-packages", "__pycache__"))
+        stage_python(python)
         if (python / "python.exe").is_file():
             tools["python"] = [python / "python.exe", "-E", "-s"]
             paths.append(python)
@@ -315,7 +333,8 @@ def run_checks(root, config, cancel, timeout):
             work = scratch / "Project"
             revision, skipped = snapshot(root, work, cancel)
             commands = discover(work)
-            if not commands:
+            smoke_enabled = config.get("browser_smoke") is True
+            if not commands and not smoke_enabled:
                 return {"status": "unsupported", "revision": revision,
                         "message": "No build or tests detected. Set commands in .strata-checks.json."}
             env = {key: os.environ[key] for key in ("SystemRoot", "SystemDrive", "WINDIR", "LOCALAPPDATA")}
@@ -375,6 +394,27 @@ def run_checks(root, config, cancel, timeout):
                     if argv[:2] == ["cmake", "-S"] and ".strata-build" in argv:
                         cmake_ready = result["status"] == "passed"
                     result["seconds"] = round(time.monotonic() - started, 1)
+            if smoke_enabled:
+                row = {"check": "Browser smoke test", "kind": "smoke"}
+                try:
+                    settings = read_json(work / SETTINGS_FILE) if (work / SETTINGS_FILE).is_file() else {}
+                    package = read_json(work / "package.json") if (work / "package.json").is_file() else {}
+                    if not isinstance(settings, dict):
+                        raise ValueError("Project check settings must be a JSON object.")
+                    if settings.get("smoke") is False:
+                        results.append({**row, "status": "skipped", "output": "Browser smoke test disabled for this project."})
+                    elif any(r["kind"] == "build" and r["status"] != "passed" for r in results):
+                        results.append({**row, "status": "skipped", "output": "The build did not pass."})
+                    else:
+                        results.append(run_smoke(work, scratch, config,
+                                                 smoke_plan(work, settings, package), cancel, deadline))
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    results.append({**row, "status": "setup_failed", "output": str(error)[:1500]})
+            for row in results:
+                if row["kind"] == "smoke" and row.get("output"):
+                    row["detail"] = row["output"]
+            if not results:
+                return {"status": "unsupported", "revision": revision, "message": "No checks configured."}
             return {"status": "passed" if all(r["status"] == "passed" for r in results) else "incomplete",
                     "revision": revision,
                     "isolation": "Windows AppContainer (offline)", "skipped_links": skipped, "checks": results}
