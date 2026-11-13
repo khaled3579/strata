@@ -64,6 +64,7 @@
           </button>
         </div>
         <button class="st-btn st-btn--secondary" id="project-reconnect" type="button" hidden>Reconnect folder</button>
+        <button class="st-btn st-btn--secondary" id="project-check-settings-button" type="button" hidden>Check settings</button>
         <p class="project-status muted small" id="project-storage-status" role="status"></p>
         <p class="project-status muted small" id="project-status" role="status">Choose a folder to browse its files.</p>
         <ul class="project-entries" id="project-entries" aria-label="Project files and folders"></ul>
@@ -374,6 +375,29 @@
 </dialog>
 <script src="web/project-verification.js"></script>
 <script src="web/project-changes.js"></script>
+<dialog class="project-preview project-check-settings" id="project-check-settings" aria-labelledby="project-check-settings-title">
+  <div class="project-preview-head">
+    <div class="project-preview-heading">
+      <h2 id="project-check-settings-title">Check settings</h2>
+      <p id="project-check-settings-folder" dir="auto"></p>
+    </div>
+    <form method="dialog"><button class="st-btn st-btn--secondary" id="project-check-settings-close">Close</button></form>
+  </div>
+  <form id="project-check-settings-form">
+    <details id="project-check-detected">
+      <summary id="project-check-detected-title">Detected commands</summary>
+      <ul id="project-check-detected-list"></ul>
+    </details>
+    <div id="project-check-command-list"></div>
+    <p id="project-check-settings-status" role="status"></p>
+    <div class="project-check-actions">
+      <button type="button" class="st-btn st-btn--secondary" id="project-check-add">Add command</button>
+      <button type="button" class="st-btn st-btn--secondary" id="project-check-reset">Use detected commands</button>
+      <button type="submit" class="st-btn st-btn--primary" id="project-check-save">Save</button>
+    </div>
+  </form>
+</dialog>
+<script src="web/project-check-settings.js"></script>
 <script src="web/app.js"></script>
 <script type="module" src="web/project-explorer.js"></script>
 </body>

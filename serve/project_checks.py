@@ -13,7 +13,7 @@ import threading
 import time
 
 from serve.mcp import McpCancelled
-from serve.project_verification import check_kind, first_error, test_count
+from serve.project_verification import check_kind, first_error, missing_dependency, test_count
 
 
 TOOL = "project_checks__run"
@@ -23,6 +23,8 @@ MAX_FILES = 100_000
 MAX_BYTES = 2 * 1024**3
 SKIP = {".git", ".svn", ".hg", ".venv", "venv", ".pytest_cache", "__pycache__", "target", ".next", ".turbo", ".strata-build"}
 _run_lock = threading.Lock()
+_settings_lock = threading.Lock()
+SETTINGS_FILE = ".strata-checks.json"
 
 
 def read_json(path):
@@ -42,21 +44,93 @@ def python_test_command(root):
     return ["-m", "pytest", "-q", "-p", "no:cacheprovider"] if pytest else ["-m", "unittest", "discover", "-v", "-s", test_dir]
 
 
-def discover(root):
+def command_rows(root, commands):
+    if not isinstance(commands, list) or not 1 <= len(commands) <= 16:
+        raise ValueError("Configure between 1 and 16 check commands.")
+    result = []
+    for item in commands:
+        argv = item.get("argv") if isinstance(item, dict) else item
+        cwd = item.get("cwd", ".") if isinstance(item, dict) else "."
+        if (not isinstance(argv, list) or not 1 <= len(argv) <= 32
+                or not all(isinstance(arg, str) and len(arg) <= 2048 and "\0" not in arg for arg in argv)
+                or not argv[0].strip()):
+            raise ValueError("Each command needs a tool name and an array of arguments.")
+        if not isinstance(cwd, str) or not cwd or len(cwd) > 1024 or any(c in cwd for c in ":\\\0"):
+            raise ValueError("Use a project-relative working folder with forward slashes.")
+        relative = Path(cwd)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("The check working folder must be inside the project.")
+        directory = root / relative
+        if not directory.is_dir() or directory.resolve() != directory:
+            raise ValueError(f"Check working folder is unavailable: {cwd}")
+        result.append((" ".join(argv), relative.as_posix(), argv))
+    return result
+
+
+def settings_bytes(root):
+    path = root / SETTINGS_FILE
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
+            or info.st_nlink != 1 or info.st_size > 256 * 1024):
+        raise ValueError("The project check settings file must be a regular local file under 256 KiB.")
+    return path.read_bytes()
+
+
+def configured_commands(root, data):
+    config = json.loads(data.decode("utf-8-sig"))
+    return command_rows(root, config.get("commands") if isinstance(config, dict) else None)
+
+
+def check_settings(root, update=None):
+    with _settings_lock:
+        data = settings_bytes(root)
+        version = hashlib.sha256(data).hexdigest() if data is not None else "automatic"
+        detection_error = ""
+        try:
+            detected = discover(root, automatic=True)
+        except (ValueError, OSError) as exc:
+            detected, detection_error = [], str(exc)
+        if update is not None:
+            if update.get("version") != version:
+                raise ValueError("Check settings changed since they were opened. Reopen the settings and try again.")
+            if update.get("automatic") is True:
+                (root / SETTINGS_FILE).unlink(missing_ok=True)
+                data = None
+            else:
+                rows = command_rows(root, update.get("commands"))
+                data = json.dumps({"commands": [{"argv": argv, "cwd": cwd} for _, cwd, argv in rows]},
+                                  ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+                if len(data) > 256 * 1024:
+                    raise ValueError("Check settings are limited to 256 KiB.")
+                fd, name = tempfile.mkstemp(prefix=".strata-checks-", suffix=".tmp", dir=root)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(data)
+                    os.replace(name, root / SETTINGS_FILE)
+                finally:
+                    Path(name).unlink(missing_ok=True)
+        error = ""
+        try:
+            effective = configured_commands(root, data) if data is not None else detected
+        except ValueError as exc:
+            effective, error = detected, str(exc)
+
+        def describe(rows):
+            return [{"argv": argv, "cwd": cwd, "kind": check_kind(argv)} for _, cwd, argv in rows]
+
+        return {"version": hashlib.sha256(data).hexdigest() if data is not None else "automatic", "automatic": data is None,
+                "detected": describe(detected), "commands": describe(effective),
+                "error": error or detection_error}
+
+
+def discover(root, automatic=False):
     """Each command has a display name, project-relative cwd and a logical tool name."""
-    custom = root / ".strata-checks.json"
-    if custom.is_file():
-        config = read_json(custom)
-        commands = config.get("commands") if isinstance(config, dict) else None
-        if not isinstance(commands, list) or not 1 <= len(commands) <= 8:
-            raise ValueError(".strata-checks.json needs a commands array containing 1 to 8 argument arrays.")
-        result = []
-        for command in commands:
-            if (not isinstance(command, list) or not 1 <= len(command) <= 32
-                    or not all(isinstance(arg, str) and len(arg) <= 2048 and "\0" not in arg for arg in command)):
-                raise ValueError("Each project check must be an array of command arguments.")
-            result.append((" ".join(command), ".", command))
-        return result
+    data = None if automatic else settings_bytes(root)
+    if data is not None:
+        return configured_commands(root, data)
 
     result = []
     package = root / "package.json"
@@ -252,14 +326,17 @@ def run_checks(root, config, cancel, timeout):
                 tools = toolchain(commands, config, scratch, container, env)
                 container.allow(scratch, "M", temporary=True)
                 for name, directory, argv in commands:
-                    result = {"check": name[:350], "kind": check_kind(argv), "status": "unavailable"}
+                    result = {"check": name[:350], "command": subprocess.list2cmdline(argv)[:1200],
+                              "cwd": directory, "kind": check_kind(argv), "status": "unavailable"}
                     results.append(result)
                     if cancel.is_set():
                         raise McpCancelled("Project checks stopped.")
                     if argv[0] not in tools:
+                        result["missing_dependency"] = argv[0][:250]
                         result["output"] = f"Tool unavailable for isolated execution: {argv[0]}."
                         continue
-                    if name in ("CMake build", "CMake tests") and not cmake_ready:
+                    if (argv[:3] == ["cmake", "--build", ".strata-build"]
+                            or argv[:3] == ["ctest", "--test-dir", ".strata-build"]) and not cmake_ready:
                         result.update(status="skipped", output="CMake configure failed.")
                         continue
                     started = time.monotonic()
@@ -275,6 +352,8 @@ def run_checks(root, config, cancel, timeout):
                             result.update(status="timed_out", output="The command exceeded its time limit.")
                         except OSError as error:
                             result.update(status="setup_failed", output=str(error))
+                            if isinstance(error, FileNotFoundError) or getattr(error, "winerror", None) in (2, 3, 126):
+                                result["missing_dependency"] = argv[0][:250]
                         evidence, output = check_output(log)
                         for prefix, replacement in ((str(work) + "\\", ""), (work.as_posix() + "/", ""),
                                                     (tmp, "<check>"), (scratch.as_posix(), "<check>")):
@@ -286,12 +365,14 @@ def run_checks(root, config, cancel, timeout):
                                     "no tests ran" in evidence or "No tests were found" in evidence):
                                 result["status"] = "no_tests"
                         if result["status"] in ("failed", "setup_failed", "timed_out"):
+                            if dependency := missing_dependency(evidence):
+                                result["missing_dependency"] = dependency
                             result["first_error"] = first_error(evidence) or {
                                 "message": result.get("output") or f"Command exited with code {result.get('exit_code')}."
                             }
                         if output:
                             result["output"] = "\n".join(filter(None, (result.get("output"), output)))
-                    if name == "CMake configure":
+                    if argv[:2] == ["cmake", "-S"] and ".strata-build" in argv:
                         cmake_ready = result["status"] == "passed"
                     result["seconds"] = round(time.monotonic() - started, 1)
             return {"status": "passed" if all(r["status"] == "passed" for r in results) else "incomplete",

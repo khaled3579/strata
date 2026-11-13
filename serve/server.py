@@ -63,7 +63,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, ToolCa
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
-from serve.project_checks import FILE_CHANGES, TOOL as PROJECT_CHECK_TOOL, snapshot as project_snapshot  # noqa: E402
+from serve.project_checks import FILE_CHANGES, TOOL as PROJECT_CHECK_TOOL, check_settings, snapshot as project_snapshot  # noqa: E402
 from serve.project_folder import ProjectFolders, is_link, open_file as open_project_file  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
@@ -8542,6 +8542,14 @@ def make_handler(svc: Service):
                 if not isinstance(req, dict):
                     raise ValueError("Expected a project request.")
                 root = folders.resolve(req.get("token"))
+                if path == "/project/check-settings":
+                    if not isinstance(folders.files.cfg.get("project_checks"), dict):
+                        raise ValueError("Project checks are disabled.")
+                    update = req.get("update")
+                    if update is not None and not isinstance(update, dict):
+                        raise ValueError("Invalid project check settings.")
+                    self._json(200, check_settings(root, update), headers={"Cache-Control": "no-store"})
+                    return
                 if path in ("/project/changes", "/project/undo"):
                     report = folders.changes.access(root, req.get("change_id"), undo=path == "/project/undo")
                     self._json(200, report, headers={"Cache-Control": "no-store"})

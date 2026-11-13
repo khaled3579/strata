@@ -18,6 +18,8 @@ const ProjectVerification = (() => {
     no_count: ["Count unavailable", "العدد غير متاح"], first: ["First error", "أول خطأ"],
     untested: ["What wasn’t checked", "ما لم يُفحص"],
     links: ["Linked files and folders were excluded.", "استُبعدت الملفات والمجلدات المرتبطة."],
+    dependency: ["Missing dependency", "تبعية مفقودة"],
+    command: ["Command", "الأمر"],
   };
   const words = (key, ar) => (labels[key] || labels.incomplete)[ar ? 1 : 0];
   let current = null, inFlight = false, generation = 0;
@@ -89,6 +91,7 @@ const ProjectVerification = (() => {
     const counted = tests.filter(row => Number.isInteger(row.test_count));
     const sum = counted.reduce((n, row) => n + row.test_count, 0);
     const missing = rows.filter(row => !["passed", "failed"].includes(row.status));
+    const blocked = rows.filter(row => row.missing_dependency);
     const error = rows.find(row => row.first_error)?.first_error;
     const revision = report.revision;
     const state = revision ? freshness(revision, project, window.projectFolderForChat?.()) : null;
@@ -103,11 +106,15 @@ const ProjectVerification = (() => {
       ${error ? `<div class="verification-error"><strong>${label("first")}</strong>
         ${error.file ? `<bdi><code dir="ltr">${esc(error.file)}:${esc(error.line)}</code></bdi>` : ""}
         <p dir="auto">${esc(error.message)}</p></div>` : ""}
+      ${blocked.length ? `<ul class="verification-dependencies">${blocked.map(row =>
+        `<li><strong>${label("dependency")}</strong> <bdi>${esc(row.missing_dependency)}</bdi>
+          <div>${label("command")} <bdi><code dir="ltr">${esc(row.command || row.check)}</code></bdi>
+          ${row.cwd && row.cwd !== "." ? `<bdi>(${esc(row.cwd)})</bdi>` : ""}</div></li>`).join("")}</ul>` : ""}
       ${report.status !== "running" && (!build.length || !tests.length || missing.length || report.skipped_links)
         ? `<div><strong>${label("untested")}</strong><ul>
           ${!build.length ? `<li>${label("build")} · ${label("not_run")}</li>` : ""}
           ${!tests.length ? `<li>${label("test")} · ${label("not_run")}</li>` : ""}
-          ${missing.map(row => `<li><bdi>${esc(row.check)}</bdi> · ${label(row.status)}</li>`).join("")}
+          ${missing.map(row => `<li><bdi>${esc(row.command || row.check)}</bdi> · ${label(row.status)}</li>`).join("")}
           ${report.skipped_links ? `<li>${label("links")}</li>` : ""}
         </ul></div>` : ""}
       ${state ? `<p class="verification-freshness" data-state="${state}" aria-live="polite">${label(state)}</p>` : ""}

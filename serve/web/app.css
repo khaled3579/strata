@@ -85,6 +85,16 @@ main { flex: 1; min-height: 0; display: flex; }
 .verification-freshness { color: var(--st-ink-muted); font-size: var(--st-fs-sm); }
 .verification-freshness[data-state="stale"] { color: var(--st-ink); font-weight: 650; }
 .project-changes-button { margin-top: var(--st-s-2); }
+.project-check-settings form { min-width: 0; }
+.project-check-settings #project-check-settings-form { overflow: auto; padding: var(--st-s-2); }
+.project-check-settings details { margin-block-end: var(--st-s-3); overflow-wrap: anywhere; }
+.project-check-command { display: grid; grid-template-columns: minmax(0, 1fr) minmax(90px, 20%) auto;
+  align-items: end; gap: var(--st-s-2); margin-block: var(--st-s-2); }
+.project-check-command label { display: grid; gap: var(--st-s-1); min-width: 0; }
+.project-check-command input { width: 100%; font-family: var(--st-font-mono); }
+.project-check-actions { display: flex; flex-wrap: wrap; gap: var(--st-s-2); }
+@media (max-width: 600px) { .project-check-command { grid-template-columns: minmax(0, 1fr) auto; }
+  .project-check-command label:first-child { grid-column: 1 / -1; } }
 .project-changes-body details { margin-block: var(--st-s-2); }
 .project-changes-body summary { cursor: pointer; overflow-wrap: anywhere; }
 .project-changes-body pre { overflow: auto; white-space: pre; max-height: 45vh; padding: var(--st-s-2); }

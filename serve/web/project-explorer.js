@@ -50,6 +50,7 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
     nativeMode = true;
     pick.disabled = folderAction || !!busy;
     const folder = chatFolder();
+    ProjectCheckSettings.sync(folder && mcpInfo.project_checks, !!busy);
     if (root?.handle.token && folder?.token === root.handle.token) return;
     if (!folder && !root && status.textContent === "Choose a folder for this chat.") return;
     storageStatus.textContent = "";

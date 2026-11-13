@@ -3,6 +3,21 @@
 import re
 
 
+def missing_dependency(output):
+    patterns = (
+        r"No module named ['\"]?([\w.-]+)",
+        r"Cannot (?:find|resolve) (?:package|module) ['\"]([^'\"]+)['\"]",
+        r"['\"]([^'\"]+)['\"] is not recognized as an internal or external command",
+        r"no matching package named [`'\"]([^'\"\x60]+)[`'\"] found",
+        r'Could NOT find ([\w.+-]+)',
+        r'configuration file provided by\s+["\']?([\w.+-]+)',
+        r'Cannot open include file: [\'"]([^\'"]+)',
+        r'cannot open file [\'"]([^\'"]+)',
+    )
+    matches = [match for pattern in patterns if (match := re.search(pattern, output, re.IGNORECASE))]
+    return min(matches, key=lambda match: match.start())[1][:250] if matches else None
+
+
 def check_kind(args):
     tool, *flags = args
     if (tool == "ctest" or tool == "node" and "--test" in flags

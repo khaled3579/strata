@@ -33,6 +33,8 @@ The verification report appears before the final reply. It shows build and test 
 
 After Strata edits a project, **View changes** shows the files and their text diffs. You can undo the latest recorded reply in the current server session. Strata checks the affected files for later edits before restoring their earlier contents.
 
+**Check settings** lists the detected build and test commands for the selected project. Edit the commands and their working folders, save them with the project, or return to automatic detection. The verification report pairs identified missing dependencies with the affected commands.
+
 [وصف النسخة وسجل التعديلات ودليل الإعداد](docs/PROJECT_WEB.md)
 
 ## Models
