@@ -9,6 +9,22 @@
 
 namespace strata::core {
 
+// CUDA's streamed host K/V past the cells the next request can overwrite.
+// The caller owns the image and must finish the copies before publishing it or reusing the suffix.
+struct ConversationHostPark {
+    struct Piece { uint8_t* destination; const uint8_t* source; size_t bytes; };
+    struct Tail { ConversationBuffer* target; const uint8_t* source; size_t total, bytes_per_cell; };
+    int64_t protected_cells;
+    std::vector<Piece> pieces;
+    bool defer_suffix = false;
+    std::vector<Tail> tails;
+    bool copy(uint64_t floor) const;
+    // Save additional whole pages before the next request or a copy worker touches the suffix.
+    bool extend_prefix(int64_t cells, uint64_t floor);
+    bool materialization_fits(uint64_t floor) const;
+    bool materialize(uint64_t floor);
+};
+
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
 size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
@@ -18,13 +34,21 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
                           int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                          int64_t upto, bool include_index, std::string& error,
+                          int64_t unchanged_tokens, size_t* reused_bytes, ConversationHostPark* host_park);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
+bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                              int64_t upto, bool include_index, std::string& error, int64_t host_prefix);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// On the same live session, the caller has kept the streamed host cells after host_prefix intact.
+bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                             int64_t upto, bool include_index, std::string& error, int64_t host_prefix);
 // conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
 // The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
 // `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,
@@ -176,10 +200,20 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
                                 std::vector<ConversationCheckpoint>* storage = nullptr,
                                 std::vector<ConversationCheckpoint>* moved = nullptr);
+bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
+                                const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                ConversationKvReuse reuse, size_t* reused_bytes,
+                                std::vector<ConversationCheckpoint>* storage,
+                                std::vector<ConversationCheckpoint>* moved, ConversationHostPark* host_park);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
+bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
+                                    const ModelGeometry& g, const QsaState* draft, std::string& error, int64_t host_prefix);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   int64_t host_prefix);
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& session, const ModelGeometry& g,
                                                           const QsaState* draft, std::string& error);

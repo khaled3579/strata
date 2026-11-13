@@ -2391,6 +2391,27 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
     return true;
 }
 
+bool FileExpertSource::prefetch_mapped_pairs(const std::pair<int32_t, int32_t>* pairs, size_t count) const {
+#if defined(_WIN32)
+    if (base_ == nullptr || unmapped_ || !direct_.empty() || count == 0) return false;
+    using Prefetch = BOOL(WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const auto prefetch = (Prefetch) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    if (prefetch == nullptr) return false;
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    ranges.reserve(count * 3);
+    for (size_t i = 0; i < count; ++i) {
+        Span parts[3];
+        const int n = spans(pairs[i].first, pairs[i].second, parts);
+        for (int r = 0; r < n; ++r)
+            if (parts[r].n) ranges.push_back({(PVOID) parts[r].p, (SIZE_T) parts[r].n});
+    }
+    return !ranges.empty() && prefetch(GetCurrentProcess(), (ULONG_PTR) ranges.size(), ranges.data(), 0) != FALSE;
+#else
+    (void) pairs; (void) count;
+    return false;
+#endif
+}
+
 void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     if (todo.empty()) return;
     if (!direct_.empty()) {
@@ -3525,7 +3546,8 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+    bool batch_startup_reads) {
     err.clear();
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
@@ -4074,7 +4096,8 @@ bool FileExpertSource::pin_cache_complement(
                 for (int64_t expert = 0; expert < n_expert_; ++expert)
                     if (offsets[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != kNoComplement)
                         ahead.emplace_back((int32_t) layer, (int32_t) expert);
-                (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
+                if (!batch_startup_reads || !prefetch_mapped_pairs(ahead.data(), ahead.size()))
+                    (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
             }
             for (int64_t expert = 0; expert < n_expert_; ++expert) {
                 const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;

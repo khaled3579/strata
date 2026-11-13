@@ -48,7 +48,7 @@ export function installCodeSaving(chat, projectFolder, notify) {
     try {
       const file = await window.showSaveFilePicker({
         suggestedName: `code.${extensions.get(language) ?? "txt"}`,
-        startIn: folder,
+        ...(!folder.token ? {startIn: folder} : {}),
       });
       // The picker grants access to the file the person approved. The project handle is only a starting location.
       const writable = await file.createWritable();

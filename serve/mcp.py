@@ -599,7 +599,7 @@ class McpHub:
         else:
             try:
                 res = server.call(tool, arguments if isinstance(arguments, dict) else {},
-                                  float(self.settings["timeout_s"]), cancel)
+                                  float(server.cfg.get("timeout_s", self.settings["timeout_s"])), cancel)
                 text, ok = result_text(res), not res.get("isError")
                 if ok and self.settings["image_results"] and self.media_dir is not None:
                     try:
@@ -653,6 +653,10 @@ class McpHub:
 def _check_server(name, cfg, where) -> dict:
     if not isinstance(cfg, dict):
         raise SystemExit(f"[strata] {where}: MCP server {name!r} must be an object with \"command\" or \"url\"")
+    if "timeout_s" in cfg:
+        timeout = cfg["timeout_s"]
+        if type(timeout) not in (int, float) or not 0 < timeout < float("inf"):
+            raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"timeout_s\" must be positive finite seconds")
     if cfg.get("url"):
         if cfg.get("type") == "sse":
             raise SystemExit(f"[strata] {where}: MCP server {name!r} uses the old SSE transport (\"type\": \"sse\"); "

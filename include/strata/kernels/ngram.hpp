@@ -167,6 +167,8 @@ struct PleIoOptions {
     /// the prompt or token path. Needs RAM for the full table (28.8 GB IQ4_NL, 51.2 GB FP8). mlock on POSIX,
     /// the process working-set minimum plus VirtualLock on Windows; `locked()` reports the outcome.
     bool lock = false;
+    /// Windows standalone GGUF table. Maximum allocation for a direct load into resident RAM; zero uses the mapping.
+    uint64_t direct_ram_budget = 0;
     /// Direct mode with the I/O worker only: keep the SSD awake while rows are asked for - one page of the table
     /// after this long without a read (0 = off), until `keepalive_window_s` after the last request for rows
     /// (see PleReader::set_keepalive).

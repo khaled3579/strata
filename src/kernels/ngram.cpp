@@ -38,6 +38,48 @@ namespace strata::kernels {
 namespace {
 /// The A/B arm.  Host-token-path only, so it needs no atomics; see the note on `ple_prefetch_enable`.
 bool g_ple_prefetch = true;
+
+#if defined(_WIN32)
+bool read_resident_table(const std::string& path, uint64_t offset, uint64_t bytes, uint64_t allocation,
+                         uint8_t* destination, std::string& err) {
+    strata::platform::DirectFile file;
+    if (!file.open(path, err)) return false;
+    if (offset > file.size() || bytes != file.size() - offset) {
+        err = "PLE shard size changed after validation";
+        return false;
+    }
+    constexpr uint64_t kChunk = 8u << 20;
+    constexpr int kDepth = 8;
+    uint64_t next = 0;
+    while (next < allocation) {
+        int queued = 0;
+        bool ok = true;
+        for (; queued < kDepth && next < allocation; ++queued) {
+            const auto size = (uint32_t) std::min(kChunk, allocation - next);
+            if (!file.submit(offset + next, destination + next, size, next, err)) {
+                ok = false;
+                break;
+            }
+            next += size;
+        }
+        while (queued > 0) {
+            strata::platform::Completion done[kDepth];
+            const int n = file.wait(done, queued, -1);
+            for (int i = 0; i < n; ++i) {
+                const auto& read = done[i];
+                if (read.tag == strata::platform::DirectFile::WAKE_TAG) continue;
+                --queued;
+                if (!read.ok || read.tag >= bytes || read.bytes != std::min(kChunk, bytes - read.tag)) {
+                    err = "short direct PLE read";
+                    ok = false;
+                }
+            }
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+#endif
 }  // namespace
 
 void ple_prefetch_enable(bool on) { g_ple_prefetch = on; }
@@ -248,6 +290,10 @@ static_assert(PLE_ROW_BYTES_MAX >= PLE_ROW_BYTES && PLE_ROW_BYTES_MAX >= PLE_ROW
 struct PleTable::Impl {
     GgufFile* file = nullptr;
     const uint8_t* data = nullptr;
+#if defined(_WIN32)
+    uint8_t* resident = nullptr;
+    uint64_t resident_bytes = 0;
+#endif
     uint64_t n_rows = 0;
     const PleFormatInfo* fmt = &ple_format_info(PleFormat::IQ4_NL);   // the table's format (#296: Q5_0 is one of them)
     mutable uint64_t bytes_read = 0;
@@ -433,6 +479,42 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     }
     if (io.mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
 #if defined(_WIN32)
+        if (alone && io.direct_ram_budget > 0) {
+            const uint64_t page = strata::platform::DirectFile::alignment();
+            const uint64_t table_offset = impl_->file->data_start() + t->offset;
+            const uint64_t front = table_offset % page;
+            const uint64_t read_bytes = front + need;
+            const uint64_t allocation = read_bytes / page * page + (read_bytes % page ? page : 0);
+            if (allocation <= io.direct_ram_budget) {
+                auto* memory = (uint8_t*) VirtualAlloc(nullptr, (SIZE_T) allocation, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                if (memory != nullptr) {
+                    // With the mapped view closed, the unbuffered reads can use the drive queue on NTFS.
+                    delete impl_->file;
+                    impl_->file = nullptr;
+                    impl_->data = nullptr;
+                    std::string why;
+                    if (read_resident_table(gguf_path, table_offset - front, read_bytes, allocation, memory, why)) {
+                        const auto lock = strata::platform::lock_resident(memory, allocation);
+                        if (lock.ok && lock.locked_bytes == allocation) {
+                            impl_->resident = memory;
+                            impl_->resident_bytes = allocation;
+                            impl_->data = memory + front;
+                            impl_->locked = true;
+                            impl_->mode = io.mode;
+                            std::fprintf(stderr, "strata: PLE table loaded directly into %.2f GiB of resident RAM\n",
+                                         (double) allocation / 1073741824.0);
+                            return true;
+                        }
+                        why = lock.note;
+                    }
+                    VirtualFree(memory, 0, MEM_RELEASE);
+                    std::fprintf(stderr, "strata: PLE direct RAM load fell back to the mapping (%s)\n", why.c_str());
+                    PleIoOptions mapped = io;
+                    mapped.direct_ram_budget = 0;
+                    return open(gguf_path, err, mapped);
+                }
+            }
+        }
         // Windows has no mlock: the platform helper raises the process's minimum working set and
         // VirtualLocks the mapped table instead (ordinary accounts hold the privilege). A failure
         // falls back to touching the pages, i.e. plain mmap behaviour, with a warning - same as POSIX.
@@ -555,6 +637,11 @@ void PleTable::close() {
     impl_->mode = PleIo::Mmap;
     delete impl_->file;
     impl_->file = nullptr;
+#if defined(_WIN32)
+    if (impl_->resident != nullptr) VirtualFree(impl_->resident, 0, MEM_RELEASE);
+    impl_->resident = nullptr;
+    impl_->resident_bytes = 0;
+#endif
     impl_->data = nullptr;
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
@@ -568,6 +655,11 @@ bool PleTable::locked() const { return impl_->locked; }
 bool PleTable::unlock() {
     std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (!impl_->locked || impl_->data == nullptr) return false;
+#if defined(_WIN32)
+    if (impl_->resident != nullptr)
+        strata::platform::unlock_resident(impl_->resident, impl_->resident_bytes);
+    else
+#endif
     strata::platform::unlock_resident((void*) impl_->data, impl_->n_rows * (uint64_t) impl_->rb);
     impl_->locked = false;
     return true;

@@ -46,7 +46,11 @@ public:
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768, const MtpDrafter* shared = nullptr);
+              int64_t window = 32768, const MtpDrafter* shared = nullptr, bool defer_expert_tail = false);
+    static constexpr size_t kExpertUploadChunk = 64u << 20;
+    bool expert_upload_pending() const { return expert_upload_offset_ < expert_upload_bytes_; }
+    /// Finish a deferred upload before using the drafter. A supplied pinned chunk uses the draft stream.
+    bool finish_expert_upload(std::string& err, void* pinned_chunk = nullptr);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
@@ -314,6 +318,9 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    uint64_t expert_upload_offset_ = 0;
+    uint64_t expert_upload_bytes_ = 0;
+    bool upload_expert_range(uint64_t end, std::string& err, void* pinned_chunk = nullptr);
     // the prompt room: the experts' pinned host snapshot, its size, and whether a prompt has taken their contents
     // (the block itself stays where it is - see experts_lend)
     void* experts_host_ = nullptr;

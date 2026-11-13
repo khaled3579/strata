@@ -796,6 +796,22 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
 }
 
+// Each block produced one candidate with the same penalty and tie rules as the one-block greedy kernel.
+__global__ void __launch_bounds__(32)
+sampler_split_greedy_merge_kernel(const int2* __restrict__ candidates, int n_blocks, int n_vocab, int* out) {
+    const int row = (int) blockIdx.x;
+    const int lane = (int) threadIdx.x;
+    const int2* src = candidates + (size_t) row * n_blocks;
+    float best = __int_as_float(0xff800000);
+    int id = n_vocab;
+    for (int block = lane; block < n_blocks; block += 32) {
+        const int2 c = src[block];
+        take_first(best, id, __int_as_float(c.y), c.x);
+    }
+    warp_first(best, id);
+    if (lane == 0) out[row] = id < n_vocab ? id : 0;
+}
+
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
 // target's chain and the target's Philox draw.  Everything that varies per request or per round - the chain's
 // parameters, the seed, the counter (from the cell's step record), the penalty history - is read from DEVICE memory:
@@ -1271,17 +1287,26 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
                                : 0;
     if (p.greedy || p.temperature <= 0.0f) {
-        // Without penalties (shmem == 0: no window) on sm_90+, a cluster of CTAs per token - the same token; see
-        // `sampler_greedy_cluster_kernel`.  STRATA_ARGMAX_MULTI=0: always the one-block kernel.
-        static const bool multi = [] {
-            const char* v = std::getenv("STRATA_ARGMAX_MULTI");
-            return !v || std::atoi(v) != 0;
-        }();
-        // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
-        const int gthreads = 1024;
-        if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
-            sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
-                logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
+        const int n_blocks = (n_vocab - 1) / kSplitBlockSpan + 1;
+        int2* const greedy_scratch = p.split_greedy && n_blocks > 1 && n_blocks <= kSplitMaxBlocks &&
+            n_tokens <= kSplitMaxRows && !stream_capturing(stream)
+            ? split_scratch(stream, (size_t) n_tokens * n_blocks) : nullptr;
+        if (greedy_scratch != nullptr) {
+            sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0,
+                                        (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, 1,
+                                                                 n_blocks, greedy_scratch);
+            sampler_split_greedy_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(
+                greedy_scratch, n_blocks, n_vocab, out);
+        } else {
+            // The cluster kernel can pick without penalties on sm_90+. Other cases use one block per row.
+            static const bool multi = [] {
+                const char* v = std::getenv("STRATA_ARGMAX_MULTI");
+                return !v || std::atoi(v) != 0;
+            }();
+            if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
+                sampler_greedy_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+                    logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
+        }
     } else if (sampled_path() == SampledPath::Old) {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.

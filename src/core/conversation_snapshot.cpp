@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
@@ -6,6 +7,7 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +15,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <system_error>
+#include <thread>
 
 namespace strata::core {
 namespace {
@@ -113,6 +117,13 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
         return false;
     }
     return true;
+}
+
+size_t protected_host_bytes(const Layout& l, size_t bytes, int64_t protected_cells) {
+    if (l.cells == 0) return 0;
+    const int64_t guard = std::min(l.cells, protected_cells);
+    const int64_t cells = (guard / l.page_size + (guard % l.page_size != 0)) * l.page_size;
+    return bytes / size_t(l.cells) * size_t(cells);
 }
 
 // STRATA_PARK_VRAM_MIB=N (with STRATA_PARK_ASYNC): a park also keeps the whole K/V of its image in VRAM, in a slot
@@ -292,6 +303,138 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
                           int64_t unchanged_tokens, size_t* reused_bytes) {
+    return conversation_kv_save(image, st, g, upto, index, error, unchanged_tokens, reused_bytes, nullptr);
+}
+
+bool ConversationHostPark::copy(uint64_t floor) const {
+    auto copy_piece = [](const Piece& piece) {
+        std::memcpy(piece.destination, piece.source, piece.bytes);
+        progress_beat();
+    };
+    if (pieces.size() < 24 || std::thread::hardware_concurrency() < 6) {
+        for (const auto& piece : pieces) {
+            if (!conversation_memory_admit(available_host_bytes(), piece.bytes, floor)) return false;
+            copy_piece(piece);
+        }
+        return true;
+    }
+
+    // These pieces have disjoint destinations. Count unfinished copies as reservations because the OS may not
+    // yet count their destination pages as resident. If only one piece fits, wait for the others to land.
+    std::mutex mutex;
+    std::condition_variable landed;
+    size_t next = 0;
+    uint64_t reserved = 0;
+    bool refused = false;
+    auto drain = [&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!refused && next < pieces.size()) {
+            const Piece& piece = pieces[next];
+            if (!conversation_memory_admit(available_host_bytes(), reserved + piece.bytes, floor)) {
+                if (reserved == 0) {
+                    refused = true;
+                    landed.notify_all();
+                    return;
+                }
+                landed.wait(lock);
+                continue;
+            }
+            ++next;
+            reserved += piece.bytes;
+            lock.unlock();
+            copy_piece(piece);
+            lock.lock();
+            reserved -= piece.bytes;
+            landed.notify_all();
+        }
+    };
+    std::array<std::future<void>, 2> workers;
+    for (auto& worker : workers) {
+        try {
+            worker = std::async(std::launch::async, [&] {
+                conversation_detail::background_thread_placement();
+                drain();
+            });
+        } catch (const std::system_error&) {
+            break;   // the existing background thread drains any work the helpers cannot take
+        }
+    }
+    drain();
+    for (auto& worker : workers)
+        if (worker.valid()) worker.get();
+    return !refused;
+}
+
+bool ConversationHostPark::extend_prefix(int64_t cells, uint64_t floor) {
+    if (cells <= protected_cells) return true;
+    auto prefix_end = [cells](const Tail& tail) {
+        return std::min(size_t(cells), tail.total / tail.bytes_per_cell) * tail.bytes_per_cell;
+    };
+    // Bound the request's synchronous copy by bytes, since the K/V format and number of layers
+    // change what a cell costs. Leave most of the outstanding bytes for the background worker.
+    constexpr size_t kMaxForegroundBytes = size_t(128) << 20;
+    size_t foreground = 0, remaining = 0, additional = 0;
+    for (const auto& tail : tails) {
+        const size_t start = tail.target->size();
+        const size_t end = prefix_end(tail);
+        const size_t peak = tail.target->allocation_peak(end, true);
+        if (peak == SIZE_MAX || !conversation_detail::add(additional, peak - tail.target->bytes()) ||
+            !conversation_detail::add(remaining, tail.total - start) ||
+            (end > start && !conversation_detail::add(foreground, end - start))) return false;
+    }
+    if (foreground > std::min(kMaxForegroundBytes, remaining / 4) ||
+        !conversation_memory_admit(available_host_bytes(), additional, floor)) return false;
+    for (const auto& tail : tails) {
+        const size_t start = tail.target->size();
+        const size_t end = prefix_end(tail);
+        if (end <= start) continue;
+        const size_t peak = tail.target->allocation_peak(end, true);
+        if (peak == SIZE_MAX || !conversation_memory_admit(available_host_bytes(), peak - tail.target->bytes(), floor))
+            return false;
+        try {
+            tail.target->resize_for_overwrite(end, true);
+        } catch (const std::bad_alloc&) {
+            // A partial allocation can grow size() before throwing. Only copied bytes may be kept.
+            tail.target->resize_for_overwrite(start, true);
+            return false;
+        }
+        if (!tail.target->visit(start, end - start, [&](uint8_t* p, size_t n, size_t at) {
+                std::memcpy(p, tail.source + at, n);
+                return true;
+            })) {
+            tail.target->resize_for_overwrite(start, true);
+            return false;
+        }
+    }
+    protected_cells = cells;
+    return true;
+}
+
+bool ConversationHostPark::materialization_fits(uint64_t floor) const {
+    size_t additional = 0;
+    for (const auto& tail : tails) {
+        const size_t peak = tail.target->allocation_peak(tail.total, true);
+        if (peak == SIZE_MAX || !conversation_detail::add(additional, peak - tail.target->bytes())) return false;
+    }
+    return conversation_memory_admit(available_host_bytes(), additional, floor);
+}
+
+bool ConversationHostPark::materialize(uint64_t floor) {
+    if (!materialization_fits(floor)) return false;
+    for (const auto& tail : tails) {
+        const size_t start = tail.target->size();
+        tail.target->resize_for_overwrite(tail.total, true);
+        if (!tail.target->visit(start, tail.total - start, [&](uint8_t* p, size_t n, size_t at) {
+                pieces.push_back({p, tail.source + at, n});
+                return true;
+            })) return false;
+    }
+    return copy(floor);
+}
+
+bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                          int64_t upto, bool index, std::string& error,
+                          int64_t unchanged_tokens, size_t* reused_bytes, ConversationHostPark* host_park) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -318,6 +461,39 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+        if (host_park && host_park->protected_cells > 0 && st.kv_mode == 1 && i < 4 && sizes[i] > keep && src[i]) {
+            cudaPointerAttributes at{};
+            if (cudaPointerGetAttributes(&at, src[i]) == cudaSuccess) {
+                if (at.type == cudaMemoryTypeHost && at.hostPointer) {
+                    const auto* from = static_cast<const uint8_t*>(at.hostPointer);
+                    const size_t prefix = protected_host_bytes(l, sizes[i], host_park->protected_cells);
+                    if (host_park->defer_suffix) {
+                        const size_t ready = std::max(keep, prefix);
+                        dst[i]->resize_for_overwrite(ready, true);
+                        if (!dst[i]->visit(keep, ready - keep, [&](uint8_t* p, size_t n, size_t at) {
+                                std::memcpy(p, from + at, n);
+                                return true;
+                            })) return false;
+                        if (ready < sizes[i]) host_park->tails.push_back({dst[i], from, sizes[i], sizes[i] / size_t(l.cells)});
+                        if (reused_bytes) *reused_bytes += keep;
+                        continue;
+                    }
+                    dst[i]->resize_for_overwrite(sizes[i]);
+                    if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t offset) {
+                            const size_t front = offset < prefix ? std::min(n, prefix - offset) : 0;
+                            if (front) std::memcpy(p, from + offset, front);
+                            if (n > front) host_park->pieces.push_back({p + front, from + offset + front, n - front});
+                            return true;
+                        })) return false;
+                    if (reused_bytes) *reused_bytes += keep;
+                    continue;
+                }
+            } else (void) cudaGetLastError();
+        }
+#else
+        (void) host_park;
+#endif
         {   // STRATA_PARK_VRAM_MIB: with a slot, the whole part goes device to device into it (a restore of this image
             // reads it from there) and the host buffer gets only the bytes past the kept prefix, read from the slot on
             // the background thread; a part the slot cannot take is copied synchronously - never through the stage,
@@ -383,6 +559,11 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
 
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                               int64_t upto, bool index, std::string& error) {
+    return conversation_kv_validate(image, st, g, upto, index, error, 0);
+}
+
+bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                              int64_t upto, bool index, std::string& error, int64_t host_prefix) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -394,8 +575,14 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
         error = "conversation snapshot: incompatible K/V geometry";
         return false;
     }
-    for (size_t i = 0; i < src.size(); ++i)
-        if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+    for (size_t i = 0; i < src.size(); ++i) {
+        const size_t needed = host_prefix > 0 && st.kv_mode == 1 && i < 4
+                            ? protected_host_bytes(l, sizes[i], host_prefix) : sizes[i];
+        if (src[i]->size() < needed || src[i]->size() > sizes[i]) {
+            error = "conversation snapshot: invalid K/V payload size";
+            return false;
+        }
+    }
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)
         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
@@ -454,10 +641,15 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
+    return conversation_kv_restore(image, st, g, upto, index, error, 0);
+}
+
+bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                             int64_t upto, bool index, std::string& error, int64_t host_prefix) {
     // STRATA_PARK_VRAM_MIB: from the image's VRAM slot when it holds every part (no host buffer is read: no join)
-    const VramKvSlot* slot = vram_kv_find(image.dev_tag);
+    const VramKvSlot* slot = host_prefix > 0 ? nullptr : vram_kv_find(image.dev_tag);
     if (slot == nullptr) conversation_park_join();
-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+    if (!conversation_kv_validate(image, st, g, upto, index, error, host_prefix)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
     std::array<size_t,5> sizes{}, off{};
@@ -468,8 +660,14 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
             if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
         return refresh_residency(st, g, upto, error);
     }
+    if (host_prefix > 0 && st.kv_mode == 1) {
+        Layout l{};
+        if (!layout(st, g, upto, index, l, error)) return false;
+        sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+        for (size_t i = 0; i < 4; ++i) sizes[i] = protected_host_bytes(l, sizes[i], host_prefix);
+    }
     for (size_t i = 0; i < src.size(); ++i)
-        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+        if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
     return refresh_residency(st, g, upto, error);
@@ -594,6 +792,7 @@ void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& cop
 
 bool conversation_park_async_begin(size_t need) {
     if (park_trace_on()) kv_save_trace() = {};   // (the sums cover this park's saves)
+    if (!park_async_on()) return false;   // synchronous saves on distinct devices share no staging state
     conversation_park_join();   // (the stage is reused)
     ParkAsync& a = park_async();
     a.active = false;
@@ -601,7 +800,7 @@ bool conversation_park_async_begin(size_t need) {
     a.used = 0;
     a.slot = nullptr;
     a.slot_tag = 0;
-    if (!park_async_on() || need == 0) return false;
+    if (need == 0) return false;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
     // STRATA_PARK_VRAM_MIB: a slot of the whole K/V instead of the stage, while the budget allows - taken before the

@@ -4327,6 +4327,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #endif
                     const bool host_by_dma = staged && kv_host_dma;
                     const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
+                    if (staged && before_host_kv_write) before_host_kv_write(p0 + T);
                     if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
                         // streamed: each half writes its part of the host copy and of the staging pool
                         strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
@@ -7687,6 +7688,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
 #endif
                         const bool host_by_dma = staged && kv_host_dma;
                         const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
+                        if (staged && before_host_kv_write) before_host_kv_write(p0 + T);
                         if (st.kv_hybrid) {
                             // streamed: each half writes its part of the host copy and of the staging pool
                             strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, cs);

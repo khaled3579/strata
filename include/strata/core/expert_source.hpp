@@ -779,7 +779,7 @@ public:
         const ExpertCache& cache, std::string& err, bool pin = true,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
-        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr, bool batch_startup_reads = false);
     /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
     /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
     /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
@@ -928,6 +928,8 @@ public:
     /// Mapped reads: asks the OS for these pairs' blobs ahead (platform::advise_willneed).  False when unbuffered,
     /// when read-ahead is off, or before `open`.
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
+    /// Windows startup. Submit a batch of mapped expert spans to the OS in one read-ahead call.
+    bool prefetch_mapped_pairs(const std::pair<int32_t, int32_t>* pairs, size_t count) const;
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).

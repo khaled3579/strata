@@ -42,6 +42,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <vector>
 #include "strata/platform/cpu_relax.hpp"
@@ -264,10 +265,55 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 #endif
 }
 
-bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-                      int64_t window, const MtpDrafter* shared) {
+bool MtpDrafter::finish_expert_upload(std::string& err, void* pinned_chunk) {
+    return upload_expert_range(expert_upload_bytes_, err, pinned_chunk);
+}
+
+bool MtpDrafter::upload_expert_range(uint64_t end, std::string& err, void* pinned_chunk) {
 #if defined(STRATA_GPU_METAL)
-    (void) window; (void) shared;
+    (void) end; (void) err; (void) pinned_chunk;
+    return true;
+#else
+    if (expert_upload_offset_ == end) return true;
+    const OnDevice on_device(device_);
+    auto close_file = [](FILE* f) { std::fclose(f); };
+    std::unique_ptr<FILE, decltype(close_file)> file(std::fopen((rt_dir_ + "/experts.bin").c_str(), "rb"), close_file);
+    if (!file) { err = "mtp: cannot open experts.bin"; return false; }
+    if (expert_upload_offset_ != 0 && STRATA_FILE_SEEK64(file.get(), expert_upload_offset_, SEEK_SET) != 0) {
+        err = "mtp: cannot seek to the remaining draft experts";
+        return false;
+    }
+#if !defined(_WIN32)
+    strata::platform::advise_willneed(fileno(file.get()), expert_upload_offset_, end - expert_upload_offset_);
+#endif
+    // Large fread calls avoid the tiny reads made by the Windows C++ file stream. Reuse one chunk.
+    std::vector<uint8_t> chunk(pinned_chunk == nullptr ? kExpertUploadChunk : 0);
+    void* data = pinned_chunk != nullptr ? pinned_chunk : chunk.data();
+    for (uint64_t off = expert_upload_offset_; off < end;) {
+        const size_t n = (size_t) std::min<uint64_t>(kExpertUploadChunk, end - off);
+        if (std::fread(data, 1, n, file.get()) != n) { err = "mtp: experts.bin is truncated"; return false; }
+        cudaError_t copy;
+        if (pinned_chunk != nullptr) {
+            copy = cudaMemcpyAsync(experts_ + off, data, n, cudaMemcpyHostToDevice, cs_);
+            if (copy == cudaSuccess) copy = cudaStreamSynchronize(cs_);
+        } else {
+            copy = cudaMemcpy(experts_ + off, data, n, cudaMemcpyHostToDevice);
+        }
+        if (copy != cudaSuccess) {
+            err = std::string("mtp: draft expert upload failed: ") + cudaGetErrorString(copy);
+            return false;
+        }
+        off += n;
+    }
+    expert_upload_offset_ = end;
+    return true;
+#endif
+}
+
+bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
+                      int64_t window, const MtpDrafter* shared, bool defer_expert_tail) {
+#if defined(STRATA_GPU_METAL)
+    (void) window; (void) shared; (void) defer_expert_tail;
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;
@@ -329,25 +375,19 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // ---- the 512 routed experts, one blob each
     if (shared == nullptr) {
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
-        // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
-        // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
-        FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
-        if (f == nullptr) { err = "mtp: cannot open experts.bin"; return false; }
-        struct Closer {
-            FILE* f;
-            ~Closer() { if (f != nullptr) std::fclose(f); }
-        } closer{f};
         if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-#if !defined(_WIN32)
-        strata::platform::advise_willneed(fileno(f), 0, bytes);
-#endif
-        std::vector<uint8_t> chunk(64u << 20);
-        for (uint64_t off = 0; off < bytes;) {
-            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
-            off += n;
+        expert_upload_bytes_ = bytes;
+        // Bound late disk work to two chunks. The earlier reads can use the file cache before the
+        // main model's cold load puts pressure on it.
+        const uint64_t tail = defer_expert_tail ? std::min<uint64_t>(2 * kExpertUploadChunk, bytes) : 0;
+        if (tail != 0) {
+            // Commit the allocation before sizing the model's expert caches under WDDM.
+            if (cudaMemset(experts_ + bytes - tail, 0, tail) != cudaSuccess) {
+                err = "mtp: cannot reserve the draft expert pages";
+                return false;
+            }
         }
+        if (!upload_expert_range(bytes - tail, err)) return false;
         vram_ += bytes;
     }
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
@@ -534,6 +574,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (shared != nullptr) {
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
                      (double) vram_ / 1048576.0);
+    } else if (expert_upload_pending()) {
+        std::fprintf(stderr, "strata mtp: draft layer reserved %.0f MiB of VRAM, deferred the last %.0f MiB of expert weights\n",
+                     (double) vram_ / 1048576.0, (double) (expert_upload_bytes_ - expert_upload_offset_) / 1048576.0);
     } else {
         std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
                      (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,

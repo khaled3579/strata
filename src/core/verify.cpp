@@ -748,6 +748,7 @@ Verifier::~Verifier() {
     for (cudaEvent_t e : {mfork_, mjoin_, pfork_, pjoin_})
         if (e) cudaEventDestroy(e);
     if (commit_done_) cudaEventDestroy(commit_done_);
+    if (handoff_event_) cudaEventDestroy(handoff_event_);
     if (ev_done_) cudaEventDestroy(ev_done_);
     if (ev_commit_) cudaEventDestroy(ev_commit_);
     if (prof_pin_) cudaFreeHost(prof_pin_);
@@ -3198,6 +3199,17 @@ bool Verifier::chain_overlap() const {
            next_->hflag_in_h_ == hflag_out_h_ && next_->device_ != device_ && !next_->ple_stage();
 }
 
+bool Verifier::prepare_event_handoff() {
+    if (handoff_event_ != nullptr) return true;
+    if (next_ == nullptr || next_->next_ != nullptr || device_ == next_->device_ ||
+        hflag_out_d_ != nullptr || next_->hflag_in_d_ != nullptr || next_->ple_stage()) return false;
+    const OnDevice on(device_);
+    if (cudaEventCreateWithFlags(&handoff_event_, cudaEventDisableTiming) == cudaSuccess) return true;
+    (void) cudaGetLastError();
+    handoff_event_ = nullptr;
+    return false;
+}
+
 bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
     prelaunched_ = 0;
@@ -3573,6 +3585,37 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return false;
     }
 #endif
+    // The last stage can queue the same greedy sampler now that all of its expert doorbells
+    // have been served. The verify stream orders the logits before the sampler reads them.
+    const bool greedy_queued = queued_greedy_sampling_ && le_ == g.n_layers && head_sampling_ &&
+        sampling_.greedy && !measure && !copy_used_ && (hist_d_ != nullptr || sampling_.logit_bias != nullptr);
+    if (greedy_queued) {
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) pos0;
+        sp.split_greedy = true;
+        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+    }
+    bool event_chained = false, next_ok = true;
+    // All expert doorbells on this stage have been served. Queue the dependency after the
+    // residual writes, then let the host set up the second stage while this stage finishes.
+    if (event_handoff_on_ && !copy_used_ && h_bal_ == nullptr) {
+        next_->refresh_ar();
+        const auto* next_graphs = next_->ar_off_ ? next_->exec_nr_ : next_->exec_;
+        if (next_graphs[sel_long_][T] != nullptr && next_->commit_exec_ != nullptr) {
+            cudaError_t dep = cudaEventRecord(handoff_event_, cs_);
+            if (dep == cudaSuccess) {
+                const OnDevice on_next(next_->device_);
+                dep = cudaStreamWaitEvent(next_->cs_, handoff_event_, 0);
+            }
+            if (dep != cudaSuccess) {
+                err = std::string("verify: cross-device hand-off: ") + cudaGetErrorString(dep);
+                return false;
+            }
+            event_chained = true;
+            next_ok = next_->run(T, tokens, pos0, pool, next_user_, out, err);
+            ++event_handoffs_;
+        }
+    }
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
@@ -3597,7 +3640,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
-        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+        return event_chained ? next_ok : next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
@@ -3634,8 +3677,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             return false;
         }
         if (judged) ++spec_windows;
-        else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
+        else if (!greedy_queued) {
+            sp.split_greedy = queued_greedy_sampling_ && sp.greedy;
+            sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        }
+        if (!greedy_queued && cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
         }
@@ -3873,8 +3919,9 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
-bool Verifier::commit(int n_keep, std::string& err) {
+bool Verifier::commit(int n_keep, std::string& err, bool split_async) {
 #if defined(STRATA_GPU_METAL)
+    (void) split_async;
     return strata::metal_engine::window_commit(metal_, n_keep, err);
 #endif
     const OnDevice on_device(device_);
@@ -3914,7 +3961,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-        if (!g_commit_async || next_ != nullptr) {
+        if (!split_async && (!g_commit_async || next_ != nullptr)) {
             const cudaError_t se = cudaStreamSynchronize(cs_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
@@ -3930,7 +3977,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit(n_keep, err);
+    return next_ == nullptr || next_->commit(n_keep, err, split_async);
 }
 
 bool Verifier::wait_commit(std::string& err) {

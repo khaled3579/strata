@@ -520,6 +520,16 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* storage,
                                 std::vector<ConversationCheckpoint>* moved) {
+    return conversation_snapshot_save(image, view, ss, g, draft, error, std::move(reuse), reused_bytes,
+                                      storage, moved, nullptr);
+}
+
+bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+                                const SessionState& ss, const ModelGeometry& g,
+                                const QsaState* draft, std::string& error,
+                                ConversationKvReuse reuse, size_t* reused_bytes,
+                                std::vector<ConversationCheckpoint>* storage,
+                                std::vector<ConversationCheckpoint>* moved, ConversationHostPark* host_park) {
     static const bool ptr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -579,7 +589,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     for (size_t j = 0; j < layers; ++j) {
         const auto k0 = now();
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+                                  unchanged, reused_bytes, host_park)) return false;
         const double kt = ms(k0, now());
         kv_sum += kt; kv_max = std::max(kv_max, kt);
     }
@@ -675,6 +685,11 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
 
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    return conversation_snapshot_validate(image, ss, g, draft, error, 0);
+}
+
+bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
+                                    const ModelGeometry& g, const QsaState* draft, std::string& error, int64_t host_prefix) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
@@ -687,7 +702,7 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < layers; ++j)
-        if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
+        if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error, host_prefix)) return false;
     return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
 }
 
@@ -695,14 +710,20 @@ bool conversation_copy_stream_ready(int device) { return conversation_detail::co
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    return conversation_snapshot_restore(image, ss, g, draft, error, 0);
+}
+
+ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   int64_t host_prefix) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
     conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
-    if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+    if (!conversation_snapshot_validate(image, ss, g, draft, error, host_prefix)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
+        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error, host_prefix))
             return ConversationRestore::transfer_failed;
     if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;

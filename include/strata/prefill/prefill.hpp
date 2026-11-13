@@ -218,6 +218,8 @@ public:
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+    /// Before submitting a streamed host K/V write. The argument is the exclusive end cell of the write.
+    std::function<void(int64_t)> before_host_kv_write;
     /// DFlash2 prompt taps (CUDA / HIP, single stage): before `run`, ask for the completed output of each layer in `layers` (zero-based; the
     /// mean of the hc streams) for the prompt rows at positions >= `first_pos`, at most `cap_rows` rows per chunk (a staging buffer of
     /// cap_rows x layers x n_embd floats is allocated at the first chunk).  After each chunk that has such rows, on_taps(taps

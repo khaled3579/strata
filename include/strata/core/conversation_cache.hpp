@@ -254,9 +254,11 @@ public:
     /// with one long conversation spends the cache on the side requests and evicts the long one (oldest first) -
     /// exactly the reuse it wanted.  0 parks every conversation, whatever its size.
     bool wants(int64_t tokens) const { return min_tokens_ <= 0 || tokens >= min_tokens_; }
+    size_t budget() const { return budget_; }
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
+    uint64_t newest_serial() const { return serials_.empty() ? 0 : serials_.back(); }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
         int64_t n = 0;
@@ -380,8 +382,11 @@ public:
 
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
-    bool make_room(size_t incoming, size_t held = 0) {
-        if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
+    // A proposed budget becomes permanent only when put() stores the image.
+    bool make_room(size_t incoming, size_t held = 0, size_t proposed_budget = 0) {
+        const size_t budget = std::max(budget_, proposed_budget);
+        if (!enabled() || held > budget || incoming > budget - held) return false;
+        const size_t room = budget - held - incoming;
         auto stays = [&](size_t i) { return entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_); };
         if (guarded_ != 0 && index_of(guarded_) != SIZE_MAX) {
             // with everything else gone, would it fit beside the entries that stay (the guarded donor and any pinned
@@ -389,10 +394,10 @@ public:
             size_t kept = 0, kept_bytes = 0;
             for (size_t i = 0; i < entries_.size(); ++i)
                 if (stays(i)) { ++kept; kept_bytes += entries_[i].bytes(); }
-            if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
+            if (kept >= slots_ || kept_bytes > room) { guard_blocked_ = true; return false; }
         }
-        if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+        if (bytes() > room) reuse_ = {};
+        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > room)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
             if (!evict_oldest()) return false;
@@ -514,13 +519,21 @@ public:
         return longest;
     }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    bool put(SavedConversation&& image, size_t held = 0, size_t proposed_budget = 0) {
         const size_t n = image.bytes();
-        if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
+        const size_t budget = std::max(budget_, proposed_budget);
+        if (!enabled() || held > budget || n > budget - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
-        if (!make_room(n, held)) return false;
-        entries_.push_back(std::move(image));
-        serials_.push_back(next_serial_++);
+        if (!make_room(n, held, budget)) return false;
+        serials_.push_back(next_serial_);
+        try {
+            entries_.push_back(std::move(image));
+        } catch (...) {
+            serials_.pop_back();
+            throw;
+        }
+        ++next_serial_;
+        budget_ = budget;
         bytes_ += n;
         return true;
     }

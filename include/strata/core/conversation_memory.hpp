@@ -64,6 +64,9 @@ std::optional<HostMemoryReading> sample_host_memory();
 
 std::optional<uint64_t> available_host_bytes();
 
+inline constexpr int64_t kAutoConversationCacheMaxMib = 8192;
+inline constexpr int64_t kAutoConversationCacheStepMib = 256;
+
 /// #3493: the conversation cache budget (MiB) --serve uses when --conversation-cache-mib was not given, from the RAM that is available
 /// once the model is loaded: 40% of what is left above the parking floor, at most 8192 (four 100K-token agent conversations were
 /// parked in 8 GiB in the report), in steps of 256, and 0 (off) when less than 1024 would be left to give.  Unknown telemetry: 0.
@@ -72,8 +75,8 @@ inline int64_t auto_conversation_cache_mib(std::optional<uint64_t> available, in
     const int64_t usable = (int64_t) (*available >> 20) - min_free_mib;
     if (usable <= 0) return 0;
     int64_t mib = usable * 2 / 5;
-    if (mib > 8192) mib = 8192;
-    mib -= mib % 256;
+    if (mib > kAutoConversationCacheMaxMib) mib = kAutoConversationCacheMaxMib;
+    mib -= mib % kAutoConversationCacheStepMib;
     return mib >= 1024 ? mib : 0;
 }
 
@@ -82,6 +85,20 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 inline bool conversation_memory_admit(std::optional<uint64_t> available,
                                       uint64_t allocation, uint64_t floor) {
     return available && *available >= floor && allocation <= *available - floor;
+}
+
+/// Grow the automatic cache for one snapshot and any in-flight image already in RAM.
+/// Only the new allocation must fit beside the live RAM floor.
+inline uint64_t auto_conversation_cache_growth(uint64_t budget, uint64_t snapshot, uint64_t held,
+                                               uint64_t additional, uint64_t floor,
+                                               std::optional<uint64_t> available) {
+    constexpr uint64_t cap = uint64_t{kAutoConversationCacheMaxMib} << 20;
+    constexpr uint64_t step = uint64_t{kAutoConversationCacheStepMib} << 20;
+    if (budget == 0 || held > cap || snapshot > cap - held ||
+        !conversation_memory_admit(available, additional, floor))
+        return budget;
+    const uint64_t needed = snapshot + held;
+    return needed > budget ? (needed + step - 1) / step * step : budget;
 }
 
 } // namespace strata::core

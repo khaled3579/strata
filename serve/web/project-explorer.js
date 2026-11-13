@@ -5,7 +5,7 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
   "use strict";
 
   const explorer = document.getElementById("project-explorer");
-  const chat = document.getElementById("view-chat");
+  const chatView = document.getElementById("view-chat");
   const toggle = document.getElementById("project-toggle");
   const panel = document.getElementById("project-panel");
   const pick = document.getElementById("project-pick");
@@ -21,7 +21,52 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
   let root;
   let activeRefresh;
   let folderAction = false;
-  const fileActions = projectFileActions(() => root?.handle);
+  const fileActions = projectFileActions(() => root?.handle, localRequest);
+  const browserPicker = window.isSecureContext && typeof window.showDirectoryPicker === "function";
+  let nativeMode = false;
+
+  function chatFolder() {
+    return listOn ? chat?.projectFolder : store.get("singleChatProject", null);
+  }
+
+  async function localRequest(action, parts, extra = {}) {
+    const token = root?.handle.token;
+    const response = await fetch(`project/${action}`, {
+      method: "POST",
+      headers: headers(true),
+      body: JSON.stringify({token, parts, ...extra}),
+    });
+    if (!response.ok) {
+      const result = await response.json();
+      throw new Error(result.error?.message || "Could not access the project.");
+    }
+    return response;
+  }
+
+  window.projectFolderForChat = () => nativeMode ? chatFolder() : null;
+  window.syncProjectFolder = () => {
+    if (!mcpInfo.project_picker) return;
+    nativeMode = true;
+    pick.disabled = folderAction || !!busy;
+    const folder = chatFolder();
+    if (root?.handle.token && folder?.token === root.handle.token) return;
+    if (!folder && !root && status.textContent === "Choose a folder for this chat.") return;
+    storageStatus.textContent = "";
+    if (folder) {
+      selectFolder({ ...folder, kind: "directory" }, true);
+      return;
+    }
+    root = null;
+    entries.replaceChildren();
+    fileActions.reconcile();
+    name.hidden = true;
+    refresh.disabled = true;
+    reconnect.hidden = true;
+    pick.title = "";
+    pickLabel.textContent = "Choose folder";
+    pick.setAttribute("aria-label", "Choose folder");
+    status.textContent = "Choose a folder for this chat.";
+  };
 
   async function storedFolder(handle) {
     const database = await new Promise((resolve, reject) => {
@@ -44,7 +89,7 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
   }
 
   function visible() {
-    return !panel.hidden && !chat.hidden && !document.hidden;
+    return !panel.hidden && !chatView.hidden && !document.hidden;
   }
 
   function setOpen(open) {
@@ -118,11 +163,20 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
   }
 
   async function readBranch(branch) {
-    const handles = [];
+    let handles = [];
     try {
-      for await (const handle of branch.handle.values()) handles.push(handle);
+      if (root?.handle.token) {
+        const response = await localRequest("entries", branch.parts);
+        ({entries: handles} = await response.json());
+      } else {
+        for await (const handle of branch.handle.values()) handles.push(handle);
+      }
     } catch (error) {
       if (branch !== root && !branch.row?.isConnected) return;
+      if (root?.handle.token) {
+        branch.message.textContent = error.message;
+        return;
+      }
       if (error.name === "NotAllowedError" || error.name === "NotFoundError") {
         renderEntries(branch, []);
         if (branch === root && error.name === "NotAllowedError") {
@@ -194,21 +248,37 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
       if (!root) storageStatus.textContent = "Could not restore a saved folder in this browser.";
       return;
     }
-    if (handle?.kind !== "directory" || root) return;
+    if (handle?.kind !== "directory" || root || nativeMode) return;
     const permission = await handle.queryPermission(readOnly).catch(() => "prompt");
-    if (!root) selectFolder(handle, permission === "granted");
+    if (!root && !nativeMode) selectFolder(handle, permission === "granted");
   }
 
-  function setFolderAction(busy) {
-    folderAction = busy;
-    pick.disabled = busy;
-    reconnect.disabled = busy;
+  function setFolderAction(pending) {
+    folderAction = pending;
+    pick.disabled = pending || (nativeMode && !!busy);
+    reconnect.disabled = pending;
   }
 
-  pick.addEventListener("click", async () => {
-    if (folderAction) return;
+  pick.addEventListener("click", async event => {
+    if (!event.isTrusted || folderAction || (nativeMode && busy)) return;
     setFolderAction(true);
+    storageStatus.textContent = "";
     try {
+      if (nativeMode) {
+        const selectedChat = listOn ? chat : null;
+        const singleChat = messages;
+        const response = await localRequest("pick", []);
+        const {folder} = await response.json();
+        if (!folder) return;
+        if (selectedChat && chats.includes(selectedChat)) {
+          selectedChat.projectFolder = folder;
+          chatStore.put(H.cleanChat(selectedChat));
+        } else if (!listOn && !selectedChat && singleChat === messages) {
+          store.set("singleChatProject", folder);
+        }
+        window.syncProjectFolder();
+        return;
+      }
       const handle = await window.showDirectoryPicker({ ...readOnly, id: "strata-project" });
       selectFolder(handle, true);
       storageStatus.textContent = "";
@@ -218,7 +288,7 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
         storageStatus.textContent = "Could not remember this folder in this browser.";
       }
     } catch (error) {
-      if (error.name !== "AbortError") status.textContent = "Could not open the selected folder.";
+      if (error.name !== "AbortError") storageStatus.textContent = error.message || "Could not open the selected folder.";
     } finally {
       setFolderAction(false);
     }
@@ -242,14 +312,14 @@ import { projectFileActions, projectIcon } from "./project-file-actions.js";
   setOpen(!window.matchMedia("(max-width: 760px)").matches);
   toggle.addEventListener("click", () => setOpen(panel.hidden));
   refresh.addEventListener("click", refreshTree);
-  if (!window.isSecureContext || typeof window.showDirectoryPicker !== "function") {
+  if (!browserPicker && !mcpInfo.project_picker) {
     pick.disabled = true;
     status.textContent = "Open Strata on localhost in a browser that supports folder access.";
-    return;
   }
+  window.syncProjectFolder();
   installCodeSaving(document.getElementById("chat"), () => root?.handle, window.toast);
-  void restoreFolder();
+  if (browserPicker && !nativeMode) void restoreFolder();
   document.addEventListener("visibilitychange", refreshTree);
-  new MutationObserver(refreshTree).observe(chat, { attributes: true, attributeFilter: ["hidden"] });
+  new MutationObserver(refreshTree).observe(chatView, { attributes: true, attributeFilter: ["hidden"] });
   window.setInterval(refreshTree, 2500);
 })();

@@ -57,7 +57,8 @@ async function openChats(fromScreen) {
   if (!chats.length) {
     const old = fromScreen ? messages : store.get("chat", []);
     if (old.length) {
-      const c = {...H.newChat(), messages: old, time: old[old.length - 1].time || Date.now()};
+      const c = {...H.newChat(), messages: old, time: old[old.length - 1].time || Date.now(),
+        projectFolder: store.get("singleChatProject", null)};
       chats = [c];
       chatStore.put(H.cleanChat(c));                    // the migrated chat is a record like the others
     }
@@ -72,7 +73,10 @@ async function setChatList(on, fromScreen) {
   $("sidebar").hidden = !on;
   $("new-btn").hidden = on;                              // the list has its own New chat
   if (!on) {                                             // off writes the single chat, so a reload shows the chat you were in
-    if (chat) messages = chat.messages;
+    if (chat) {
+      messages = chat.messages;
+      store.set("singleChatProject", chat.projectFolder || null);
+    }
     chat = null;
     store.set("chat", H.cleanMessages(messages));
     renderChat();
@@ -133,7 +137,7 @@ function openChat(id) {
 }
 function startChat() {
   if (busy) { stillWriting(); return; }
-  if (!messages.length && !chat.parent) { $("input").focus(); return; }          // already a fresh chat
+  if (!messages.length && !chat.parent && !chat.projectFolder) { $("input").focus(); return; }
   releasePending();
   closePanel();
   const prev = chatId, c = H.newChat();

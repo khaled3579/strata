@@ -59,10 +59,12 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, parser_for_template, anthropic_to_messages, anthropic_tools,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, ToolCall, parser_for_template, anthropic_to_messages, anthropic_tools,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.project_checks import FILE_CHANGES, TOOL as PROJECT_CHECK_TOOL  # noqa: E402
+from serve.project_folder import ProjectFolders, is_link, open_file as open_project_file  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
@@ -877,6 +879,7 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    BUDGET = re.compile(r"conversation cache: automatic budget raised to (\d+) MiB")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -930,6 +933,9 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+            m = self.BUDGET.search(line)
+            if m:
+                self.state["budget_mib"] = int(m.group(1))
         return dict(self.state)
 
 
@@ -949,7 +955,7 @@ def conversation_slots(engine) -> int | None:
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
-    mib = info.get("conversation_cache_mib")
+    mib = parked.get("budget_mib", info.get("conversation_cache_mib"))
     last = hist[-1] if hist else None
     return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
             "slots": info.get("conversation_cache_slots"), **parked,
@@ -4799,6 +4805,7 @@ class Service:
         self.status_lock = threading.Lock()
         self.admission_changed = threading.Condition(self.status_lock)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+        self.project_folders = None
         self.offline = False                             # no image URL fetch or MCP subprocess in strict local mode
         self.telemetry_key = ""                         # optional read-only key, valid only on /v1/telemetry
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
@@ -5572,7 +5579,8 @@ class Service:
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
         if not self.api_monitor:
             return None
-        raw = json.dumps(req, ensure_ascii=False, indent=2)
+        logged = {**req, "strata_project": "<redacted>"} if "strata_project" in req else req
+        raw = json.dumps(logged, ensure_ascii=False, indent=2)
         record = {"id": uuid.uuid4().hex[:12], "path": path, "model": req.get("model") or self.model,
                   "started_at": time.time(), "state": "queued", "stream": bool(req.get("stream")),
                   "response_format": (req.get("response_format") or {}).get("type")
@@ -6897,6 +6905,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     max_rounds = int(hub.settings["max_rounds"])
     total, rounds, done = 0, 0, None
     finalizing = False
+    needs_project_check = False
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
@@ -6916,12 +6925,23 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     own_calls += 1
                 elif ev.kind == "content":
                     text.append(ev.text)
+                    if needs_project_check:
+                        continue
                 elif ev.kind == "reasoning":
                     reasoning.append(ev.text)
             yield kind, x
         total += done["completion_tokens"]
+        automatic_check = (needs_project_check and (not calls or finalizing) and not own_calls
+                           and done["finish"] in ("stop", "length") and not cancel.is_set())
+        if automatic_check:
+            calls = [ToolCall(PROJECT_CHECK_TOOL, {})]
+            text.clear()
+            needs_project_check = False
+        elif needs_project_check:
+            for piece in text:
+                yield "event", Event("content", text=piece)
         run_them = calls and not own_calls and not finalizing and done["finish"] == "stop" and not cancel.is_set()
-        if not run_them:
+        if not run_them and not automatic_check:
             for c in calls:                              # announced, never run: close them in the client's view
                 yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
                               "chars": 0, "truncated": False, "ms": 0}
@@ -6954,6 +6974,10 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             if "r" not in box:
                 break
             r = box["r"]
+            if c.name == PROJECT_CHECK_TOOL:
+                needs_project_check = False
+            elif PROJECT_CHECK_TOOL in mcp_names and r["ok"] and r["server"] == "project_files" and tool in FILE_CHANGES:
+                needs_project_check = True
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
@@ -6967,7 +6991,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
-        if rounds >= max_rounds:
+        if rounds >= max_rounds and not finalizing:
             finalizing = True
             tools = None
             system_end = next((index for index, message in enumerate(messages)
@@ -6977,6 +7001,12 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 "reply. Answer the user's original request in their language using the results already obtained. "
                 "Explain any gaps in the available evidence. Do not request or emit further tool calls."})
             yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+        if automatic_check:
+            system_end = next((index for index, message in enumerate(messages)
+                               if message.get("role") not in ("system", "developer")), len(messages))
+            messages.insert(system_end, {"role": "system", "content":
+                "Strata automatically ran the project checks before delivery. Report failed, unavailable or "
+                "unsupported checks explicitly. If a fix is needed and tools are available, fix it and check again."})
         try:
             messages = compact_mcp_history(svc, hub, messages, tools, kw)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
@@ -8090,7 +8120,11 @@ def make_handler(svc: Service):
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
-                    self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
+                    status = svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0}
+                    if svc.project_folders and self._local_project_page(require_origin=False):
+                        status["project_picker"] = True
+                        status["project_checks"] = isinstance(svc.project_folders.files.cfg.get("project_checks"), dict)
+                    self._json(200, status)
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
@@ -8199,6 +8233,9 @@ def make_handler(svc: Service):
                 return
             if path == "/config":
                 self._config_post()
+                return
+            if path.startswith("/project/"):
+                self._project_request(path)
                 return
             if path in ("/unload", "/load") and not self._control_body():
                 return
@@ -8367,6 +8404,8 @@ def make_handler(svc: Service):
                 if self.cancel_event is not None:
                     with svc.status_lock:
                         svc.active_cancels.discard(self.cancel_event)
+                if getattr(self, "project_files", None) is not None:
+                    self.project_files.close()
                 record = self.record
                 if record is not None:
                     with svc.status_lock:
@@ -8463,6 +8502,66 @@ def make_handler(svc: Service):
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
             return complete
+
+        def _local_project_page(self, require_origin=True):
+            host = self.headers.get("Host", "")
+            origin = self.headers.get("Origin")
+            return (self.client_address[0] in LOOPBACK_NAMES and host_name(host) in LOOPBACK_NAMES
+                    and (origin == "http://" + host or (not require_origin and origin is None))
+                    and self.headers.get("Sec-Fetch-Site", "same-origin") == "same-origin")
+
+        def _project_request(self, path):
+            folders = svc.project_folders
+            if not folders or not self._local_project_page():
+                self._json(403, {"error": {"message": "Project folders are available from the local Windows page."}})
+                return
+            if not self._own_page("Project folders can be used"):
+                return
+            try:
+                if path == "/project/pick":
+                    if self._control_body():
+                        self._json(200, {"folder": folders.pick()}, headers={"Cache-Control": "no-store"})
+                    return
+                if self._chunked() or not 0 <= int(self.headers.get("Content-Length", 0)) <= 65536:
+                    self._json(413, {"error": {"message": "Project requests are limited to 64 KiB."}})
+                    return
+                req = json.loads(self._body())
+                if not isinstance(req, dict):
+                    raise ValueError("Expected a project request.")
+                root = folders.resolve(req.get("token"))
+                target = folders.entry(root, req.get("parts"))
+                if path == "/project/entries":
+                    with os.scandir(target) as items:
+                        entries = [{"name": item.name, "kind": "directory" if item.is_dir() else "file"}
+                                   for item in items
+                                   if not is_link(item.stat(follow_symlinks=False))]
+                    self._json(200, {"entries": entries}, headers={"Cache-Control": "no-store"})
+                elif path == "/project/preview":
+                    if not target.is_file():
+                        raise ValueError("Choose a project file.")
+                    with target.open("rb") as file:
+                        limit = 24 * 1024 * 1024
+                        body = file.read(limit + 1)
+                    if len(body) > limit:
+                        raise ValueError("This file is too large to preview here.")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif path == "/project/open":
+                    if not target.is_file():
+                        raise ValueError("Choose a project file.")
+                    open_project_file(req.get("action"), target)
+                    self._json(200, {"ok": True})
+                else:
+                    self._json(404, {"error": {"message": "Unknown project action."}})
+            except (ValueError, OSError) as e:
+                self._json(400, {"error": {"message": str(e)}}, headers={"Cache-Control": "no-store"})
+            except subprocess.SubprocessError:
+                self._json(503, {"error": {"message": "Windows could not open the project folder picker."}})
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -8642,13 +8741,21 @@ def make_handler(svc: Service):
                     raise ValueError(f"allowed_token_ids: {bad[0]} is outside the vocabulary "
                                      f"(0..{n_vocab - 1})")
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
-            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            hub = svc.mcp
+            use_mcp = req.get("strata_mcp") is True and hub is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
-                svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                hub.wait(10)                                      # servers still starting (only right after start)
+                if svc.project_folders:
+                    token = req.get("strata_project")
+                    if token is not None and not self._local_project_page():
+                        self._json(403, {"error": {"message": "Project tools require the local Windows page."}})
+                        return
+                    root = svc.project_folders.resolve(token) if token is not None else None
+                    hub, self.project_files = svc.project_folders.tools(root)
+                extra = hub.template_tools(exclude=own)           # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             if force and use_mcp:
@@ -8658,10 +8765,10 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            prompt_messages = compact_mcp_history(svc, svc.mcp, messages, tools, kw) if use_mcp else messages
+            prompt_messages = compact_mcp_history(svc, hub, messages, tools, kw) if use_mcp else messages
             ids, thinking, max_new = svc.prepare(prompt_messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, prompt_messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+            run = run_with_mcp(svc, hub, prompt_messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
@@ -10422,6 +10529,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if hub is not None:
         import atexit
         svc.mcp = hub
+        svc.project_folders = ProjectFolders.from_hub(hub) if a.host in LOOPBACK_NAMES else None
         if hub.settings["image_results"]:
             hub.media_dir = Path(a.config).with_suffix(".tool-media") if a.config else Path.cwd() / ".tool-media"
         print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "

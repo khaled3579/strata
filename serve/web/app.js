@@ -608,11 +608,12 @@ $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (las
 // "strata_mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
 let mcpInfo = {servers: [], tools: 0}, mcpRetry = null;
 const PROJECT_FILE_INSTRUCTIONS = [
-  "When the user asks you to implement or continue a project, carry out the work in the configured project directory using the project_files tools.",
+  "When the user asks you to implement or continue a project, use the project_files tools in the active project folder. Use paths relative to that folder.",
   "Create any missing folders and files required by the requested work as part of the task, without asking for separate confirmation.",
   "Check the relevant existing files, create parent folders before writing, and group independent tool calls in a single round when possible.",
   "For a request limited to planning, reviewing, or explaining, respond without changing files.",
 ].join(" ");
+const PROJECT_CHECK_INSTRUCTIONS = "When the user asks to verify the project, call project_checks__run. Strata also checks the latest project files after changes. Report actual results and any checks that could not run.";
 async function loadMcp() {
   try {
     const r = await fetch("mcp", {headers: headers()});
@@ -620,6 +621,7 @@ async function loadMcp() {
     mcpInfo = await r.json();
   } catch (e) { return; /* an older server: no MCP */ }
   renderMcp();
+  window.syncProjectFolder?.();
   clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
   if ((mcpInfo.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
 }
@@ -979,6 +981,7 @@ function updateAssistant(el, m, streaming) {
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
 }
 function renderChat() {
+  window.syncProjectFolder?.();
   const chat = $("chat");
   chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
   $("chat-empty").hidden = messages.length > 0;
@@ -1118,6 +1121,7 @@ function busyHint() {
 // While an answer is written, Send is off ("wait", as always) or parks the message ("queue", "interject": Chat settings)
 const parksWhileBusy = () => settings.whileBusy === "queue" || settings.whileBusy === "interject";
 function setBusy(on) {
+  window.syncProjectFolder?.();
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = (on && !parksWhileBusy()) || !!panel;
   $("input").disabled = !!panel;
@@ -1239,12 +1243,16 @@ async function generateReply() {
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-  if (settings.mcp !== false && mcpInfo.tools > 0) {
+  const projectFolder = window.projectFolderForChat?.();
+  if (settings.mcp !== false && (mcpInfo.tools > 0 || projectFolder)) {
     body.strata_mcp = true;
+    if (projectFolder) body.strata_project = projectFolder.token;
     const project = mcpInfo.servers?.find(server => server.name === "project_files"
       && (server.status === "ready" || server.status === "stopped"));
-    if (["create_directory", "write_file"].every(tool => project?.tools?.some(entry => entry.tool === tool))) {
-      body.messages.unshift({role: "system", content: PROJECT_FILE_INSTRUCTIONS});
+    if (projectFolder || (!mcpInfo.project_picker
+        && ["create_directory", "write_file"].every(tool => project?.tools?.some(entry => entry.tool === tool)))) {
+      const checks = projectFolder && mcpInfo.project_checks ? " " + PROJECT_CHECK_INSTRUCTIONS : "";
+      body.messages.unshift({role: "system", content: PROJECT_FILE_INSTRUCTIONS + checks});
     }
   }
 
@@ -1342,14 +1350,17 @@ $("new-btn").onclick = () => {
   if (panel) { closePanel(); }
   clearUndo();
   releasePending();
-  if (!messages.length) return;
+  const project = store.get("singleChatProject", null);
+  if (!messages.length && !project) return;
   const backup = messages;
+  store.set("singleChatProject", null);
   clearToolMedia();
   messages = [];
   saveChat();
   renderChat();
   toast("info", tr("chat.newToast", "New chat"), tr("chat.clearedToast", "The last one was cleared."), 6000, {label: tr("undo", "Undo"), run: () => {
     if (busy || messages.length) return;                         // a new question since: the cleared chat is not put back over it
+    if (!store.get("singleChatProject", null)) store.set("singleChatProject", project);
     messages = backup; saveChat(); renderChat();
   }});
 };

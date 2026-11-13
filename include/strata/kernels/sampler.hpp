@@ -27,6 +27,7 @@ struct SamplerParams {
     bool greedy = false;
     const float* logit_bias = nullptr; // optional device array [n_vocab], added BEFORE penalties/filters; -inf bans
     bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cu
+    bool split_greedy = false;   // CUDA: use the split reduction for greedy picks when scratch is available
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.

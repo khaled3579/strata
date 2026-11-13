@@ -47,7 +47,7 @@ public:
     }
     // Includes the old directory while reserve allocates its replacement.
     // Saturation makes an overflowing estimate fail admission before resize.
-    size_t allocation_peak(size_t n) const {
+    size_t allocation_peak(size_t n, bool exact = false) const {
         size_t total = bytes();
         if (n <= size_) return total;
         const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
@@ -55,7 +55,7 @@ public:
         const size_t full = extra / segment_bytes, tail = extra % segment_bytes;
         if (!add(total, full * segment_bytes)) return SIZE_MAX;
         if (tail && !add(total, segment_capacity(tail, full ? segment_bytes :
-                segments_.empty() ? 0 : segments_.back().capacity(), size_ != 0, size_))) return SIZE_MAX;
+                segments_.empty() ? 0 : segments_.back().capacity(), size_ != 0 && !exact, size_))) return SIZE_MAX;
         size_t count = segments_.size();
         if (!add(count, full + (tail != 0))) return SIZE_MAX;
         if (count > segments_.capacity() &&
@@ -63,10 +63,10 @@ public:
         return total;
     }
     void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
-    void resize_impl(size_t n, const uint8_t* value) {
+    void resize_impl(size_t n, const uint8_t* value, bool exact = false) {
         if (n > size_) {
             const size_t held = size_;
-            const bool growing = held != 0;
+            const bool growing = held != 0 && !exact;
             const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
             const size_t extend = std::min(n - size_, spare);
             const size_t extra = n - size_ - extend;
@@ -99,7 +99,7 @@ public:
     void pop_back() { resize(size_ - 1); }
     // resize() without the zero fill of what it adds (the fresh pages are not touched here): only for a caller that
     // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy)
-    void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
+    void resize_for_overwrite(size_t n, bool exact = false) { resize_impl(n, nullptr, exact); }
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {

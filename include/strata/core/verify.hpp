@@ -195,6 +195,11 @@ public:
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// Queue a greedy penalty pass behind the verify graph so one stream wait collects both results.
+    void set_queued_greedy_sampling(bool on) {
+        queued_greedy_sampling_ = on;
+        if (next_) next_->set_queued_greedy_sampling(on);
+    }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -223,11 +228,17 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// Prepare a cross-device dependency for serial two-stage windows. The caller selects eligible requests.
+    bool prepare_event_handoff();
+    void set_event_handoff(bool on) { event_handoff_on_ = on && handoff_event_ != nullptr; }
+    uint64_t event_handoffs() const { return event_handoffs_; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
-    bool commit(int n_keep, std::string& err);
+    /// With split_async, the caller queues the commits of distinct devices, then calls wait_commit()
+    /// before another operation that uses their session state.
+    bool commit(int n_keep, std::string& err, bool split_async = false);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -563,6 +574,7 @@ private:
     int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
+    bool queued_greedy_sampling_ = false;
 #if defined(STRATA_GPU_METAL)
     void* metal_ = nullptr;              ///< the Metal decode window (metal/src/engine/window.cpp): init/run/commit go there
 #endif
@@ -715,6 +727,9 @@ private:
     bool bal_paused_ = false;
     void pcie_balance_window(int64_t steps, int G);
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
+    cudaEvent_t handoff_event_ = nullptr;
+    bool event_handoff_on_ = false;
+    uint64_t event_handoffs_ = 0;
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     using FlagSet = strata::core::FlagRaise;

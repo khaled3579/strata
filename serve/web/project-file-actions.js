@@ -17,7 +17,7 @@ export function projectIcon(name, extraClass = "") {
   return svg;
 }
 
-export function projectFileActions(getFolder) {
+export function projectFileActions(getFolder, localRequest) {
   const menu = document.getElementById("project-menu");
   const menuName = document.getElementById("project-menu-name");
   const dialog = document.getElementById("project-preview");
@@ -85,8 +85,10 @@ export function projectFileActions(getFolder) {
     if (!dialog.open) dialog.showModal();
 
     try {
-      const file = await entry.handle.getFile();
-      const mime = images.get(extension(file.name));
+      const folder = getFolder();
+      const file = folder?.token ? await (await localRequest("preview", entry.parts)).blob()
+        : await entry.handle.getFile();
+      const mime = images.get(extension(entry.handle.name));
       if (mime) {
         if (version !== previewVersion) return;
         if (file.size > 24 * 1024 * 1024) {
@@ -95,7 +97,7 @@ export function projectFileActions(getFolder) {
         }
         imageUrl = URL.createObjectURL(file.slice(0, file.size, mime));
         const img = document.createElement("img");
-        img.alt = file.name;
+        img.alt = entry.handle.name;
         img.src = imageUrl;
         img.addEventListener("error", () => {
           if (version === previewVersion) note.textContent = "This image could not be decoded.";
@@ -122,14 +124,18 @@ export function projectFileActions(getFolder) {
       pre.textContent = text;
       body.append(pre);
       note.textContent = file.size > limit ? "Showing the first 256 KiB." : text ? "" : "This file is empty.";
-    } catch {
-      if (version === previewVersion) note.textContent = "This file is unavailable. Refresh the project and try again.";
+    } catch (error) {
+      if (version === previewVersion) note.textContent = error.message || "This file is unavailable. Refresh the project and try again.";
     }
   }
 
   async function openInWindows(entry, action) {
     const folder = getFolder();
     try {
+      if (folder?.token && entry.row.isConnected) {
+        await localRequest("open", entry.parts, {action});
+        return;
+      }
       if (!folder || !localOrigins.has(location.origin)) {
         throw new Error("Windows actions are available from the local Strata web server.");
       }
